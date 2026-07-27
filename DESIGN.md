@@ -64,10 +64,72 @@ propagates to the CLI's top-level catch is simpler than threading
 revisited once transactions need to distinguish "abort this transaction" from
 "the process should crash."
 
+## Phase 1 — Buffer Pool Manager
+
+**LRU-K (k=2) as the production eviction policy, not CLOCK.** The brief
+allowed either. LRU-K was chosen because it directly encodes the property
+that matters most for a database buffer pool: distinguishing "accessed
+once" from "accessed repeatedly." CLOCK approximates LRU cheaply but shares
+LRU's fundamental blind spot — a page touched exactly once looks the same
+to the policy as a page in a small hot working set, as long as both were
+touched recently. LRU-K's *backward k-distance* (how long ago the k-th most
+recent access happened) makes that distinction explicit: a frame with fewer
+than k accesses has "infinite" backward distance and is evicted first,
+regardless of how recent that single access was. See O'Neil, O'Neil &
+Weikum, "The LRU-K Page Replacement Algorithm For Database Disk Buffering"
+(SIGMOD 1993); this is also the policy BusTub's later-semester projects
+converged on for the same reason.
+
+**Plain LRU is implemented too, but only as a benchmark baseline
+(`LRUReplacer`), not something `BufferPoolManager` is meant to run in
+production.** It exists because "beat plain LRU" needs an honest, fully
+correct plain-LRU implementation to beat — not a strawman. It shares the
+`Replacer` interface with `LRUKReplacer` so both can be dropped into the same
+`BufferPoolManager` unmodified, which is what the Phase 1 benchmark exploits
+to run the identical trace through both.
+
+**Replacer/BufferPoolManager split, with a narrow interface between them.**
+`Replacer` knows only about frame ids and an evictable/non-evictable flag; it
+has no idea what a "page" or a "pin count" is. `BufferPoolManager` owns that
+translation (pin count hits zero → `SetEvictable(frame, true)`) and owns all
+actual page/disk state (the page table, the frame array, dirty flags, and
+writing a victim back before reuse). This mirrors the BusTub/15-445 project
+structure and, more importantly, means a CLOCK replacer could be dropped in
+later without touching `BufferPoolManager` at all — useful if a future phase
+wants to compare policies again under concurrent load.
+
+**Single mutex over the whole `BufferPoolManager`, not per-page latches.**
+Every public method takes one `std::mutex`. This is the simplest correct
+thing and is fine for now — Phase 1 has no concurrent workload requirement
+yet. Per-page (or per-bucket) latching would let concurrent `FetchPage`
+calls for *different* pages proceed in parallel, but introducing that now
+would be optimizing for a scenario (high-thread-count concurrent access)
+this project doesn't exercise until MVCC (Phase 5). Revisit then, guided by
+actual contention measurements rather than guesswork.
+
+**No free-page reuse yet, still.** `DeletePage` returns a frame to
+`BufferPoolManager`'s internal free list, but the underlying disk page id
+itself is never returned to `DiskManager` (which still only ever grows via
+`AllocatePage`). This is the same deferral noted in Phase 0 — there's still
+nothing that both frees pages *and* needs the space back (B+-tree
+merges/LSM compaction in Phase 2/3 will be the first such consumer).
+
+**`Evict()` is O(evictable frames), not O(1) or O(log n).** Both
+`LRUKReplacer` and `LRUReplacer` scan their evictable set on every eviction.
+This is visible in the benchmark numbers: `BM_Zipfian_LRUK` slows from ~63ms
+at pool size 8 to ~729ms at pool size 2048, almost all of it the linear
+eviction scan repeated ~200,000 times over a growing evictable set. It's an
+acceptable simplification for now (correctness and a clean interface over
+micro-optimizing a policy that may still change), but if buffer pools grow
+much larger in later phases this is the first thing to revisit — a
+priority-queue-backed LRU-K or an approximate CLOCK sweep would restore
+O(1) amortized eviction.
+
 ## Deferred to later phases
 
-- Buffer pool (pinning, eviction policy) — Phase 1.
 - Free-page reuse — Phase 2 (B+-tree) / Phase 3 (LSM), once deletes exist.
 - Group commit / log-buffer batching for the WAL — Phase 4.
-- Concurrent multi-writer safety beyond what `pread`/`pwrite` gives for free —
-  revisit once the buffer pool introduces shared mutable frame state.
+- Per-page latching in `BufferPoolManager` (currently one global mutex) —
+  revisit under MVCC (Phase 5) if contention measurements justify it.
+- O(1)/O(log n) eviction for `LRUKReplacer`/`LRUReplacer` (currently linear
+  scan) — revisit if buffer pool sizes grow enough to make it matter.

@@ -11,15 +11,22 @@ Built in phases, each with its own tests and benchmark numbers — see
 [DESIGN.md](DESIGN.md) for trade-off notes and [BENCHMARKS.md](BENCHMARKS.md)
 for results.
 
-## Status: Phase 0 — Scaffolding & Disk Manager
+## Status: Phase 1 — Buffer Pool Manager
 
 - `DiskManager` (`src/storage/disk/`): page-granular (4096-byte, fixed at
   compile time) reads/writes over a single heap file via `pread`/`pwrite`.
+- `BufferPoolManager` (`src/buffer/`): fixed frames, pin/unpin, dirty-flag
+  write-back, pluggable eviction via a `Replacer` interface.
+  - `LRUKReplacer` (k=2) — the production eviction policy.
+  - `LRUReplacer` — a plain-LRU baseline kept only to benchmark against.
 - A minimal CLI shell (`alloc` / `write` / `read` / `stats`) for poking pages
   by hand.
-- GoogleTest suite validating byte-for-byte read/write correctness,
-  zero-fill semantics, and persistence across reopen.
-- Google Benchmark suite for sequential vs. random page I/O.
+- GoogleTest suite: DiskManager byte-for-byte correctness, replacer eviction
+  order/tie-breaking for both policies, and a BufferPoolManager randomized
+  stress test (pool much smaller than the working set) validated against an
+  in-memory oracle.
+- Google Benchmark suites: sequential vs. random page I/O, and a Zipfian
+  cache hit-rate curve comparing LRU-K against plain LRU across pool sizes.
 - GitHub Actions CI (build + test + CLI smoke test + Docker build) on every
   push.
 - Docker image that builds the engine and runs the CLI.
@@ -77,8 +84,8 @@ docker run --rm -it -v dbengine-data:/home/dbengine/data dbengine
 
 ## Roadmap
 
-0. Scaffolding, Disk Manager, CI & Docker *(current)*
-1. Buffer Pool Manager (CLOCK / LRU-K eviction)
+0. Scaffolding, Disk Manager, CI & Docker
+1. Buffer Pool Manager (LRU-K eviction) *(current)*
 2. Engine A: disk-backed B+-tree
 3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters)
 4. Write-ahead log & ARIES-style crash recovery

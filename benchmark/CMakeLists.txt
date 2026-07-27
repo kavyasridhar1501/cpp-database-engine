@@ -1,5 +1,6 @@
 add_executable(dbengine_bench
   disk_manager_bench.cpp
+  buffer_pool_bench.cpp
 )
 
 target_include_directories(dbengine_bench

@@ -1,5 +1,8 @@
 add_library(dbengine_core
   storage/disk/disk_manager.cpp
+  buffer/lru_k_replacer.cpp
+  buffer/lru_replacer.cpp
+  buffer/buffer_pool_manager.cpp
 )
 
 target_include_directories(dbengine_core
