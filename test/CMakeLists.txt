@@ -3,6 +3,8 @@ add_executable(dbengine_tests
   buffer/lru_k_replacer_test.cpp
   buffer/lru_replacer_test.cpp
   buffer/buffer_pool_manager_test.cpp
+  index/b_plus_tree_test.cpp
+  index/b_plus_tree_engine_test.cpp
 )
 
 target_include_directories(dbengine_tests

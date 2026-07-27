@@ -3,6 +3,10 @@ add_library(dbengine_core
   buffer/lru_k_replacer.cpp
   buffer/lru_replacer.cpp
   buffer/buffer_pool_manager.cpp
+  index/internal_page.cpp
+  index/leaf_page.cpp
+  index/b_plus_tree.cpp
+  index/b_plus_tree_engine.cpp
 )
 
 target_include_directories(dbengine_core
