@@ -7,6 +7,10 @@ add_library(dbengine_core
   index/leaf_page.cpp
   index/b_plus_tree.cpp
   index/b_plus_tree_engine.cpp
+  lsm/bloom_filter.cpp
+  lsm/sstable.cpp
+  lsm/merge_iterator.cpp
+  lsm/lsm_tree_engine.cpp
 )
 
 target_include_directories(dbengine_core

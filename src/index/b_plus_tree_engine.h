@@ -25,6 +25,12 @@ class BPlusTreeEngine : public StorageEngine {
   bool Delete(KeyType key) override;
   std::unique_ptr<StorageIterator> Scan(KeyType start_key) override;
 
+  // Introspection used by the head-to-head benchmark (read/write/space
+  // amplification) — not part of StorageEngine.
+  size_t GetDiskReadCount() const { return disk_manager_->GetNumReads(); }
+  size_t GetDiskWriteCount() const { return disk_manager_->GetNumWrites(); }
+  size_t OnDiskBytes() const { return disk_manager_->GetNumPages() * PAGE_SIZE; }
+
  private:
   static constexpr page_id_t kMetaPageId = 0;
 

@@ -11,7 +11,7 @@ Built in phases, each with its own tests and benchmark numbers — see
 [DESIGN.md](DESIGN.md) for trade-off notes and [BENCHMARKS.md](BENCHMARKS.md)
 for results.
 
-## Status: Phase 2 — B+-Tree (Engine A)
+## Status: Phase 3 — LSM-Tree (Engine B)
 
 - `DiskManager` (`src/storage/disk/`): page-granular (4096-byte, fixed at
   compile time) reads/writes over a single heap file via `pread`/`pwrite`.
@@ -26,17 +26,25 @@ for results.
   with splits, delete with redistribute/merge, and a range-scan iterator
   over the linked leaf chain. Root page id persists across reopen via a
   metadata page.
+- `LSMTreeEngine` (`src/lsm/`): an LSM-tree behind the same `StorageEngine` —
+  a skip-list memtable flushed to immutable, Bloom-filtered, page-based
+  SSTables, a background thread doing size-tiered compaction (with
+  write-side backpressure so a fast writer can't starve it — see
+  DESIGN.md), and a k-way merge iterator over the memtable and every live
+  SSTable for reads and range scans.
 - A minimal CLI shell (`alloc` / `write` / `read` / `stats`) for poking raw
   pages by hand.
-- GoogleTest suite: DiskManager byte-for-byte correctness, replacer eviction
-  order/tie-breaking for both policies, a BufferPoolManager randomized
-  stress test, and a B+-tree randomized insert/delete/lookup/scan test (20k
-  ops) validated against a `std::map` oracle under real buffer-pool eviction
-  pressure — plus deterministic split/merge/redistribute and
-  persist-across-reopen tests.
-- Google Benchmark suites: sequential vs. random page I/O; a Zipfian cache
-  hit-rate curve comparing LRU-K against plain LRU; and B+-tree
-  point-lookup/range-scan/insert-throughput at 1M and 10M keys.
+- GoogleTest suite (81 tests): DiskManager, replacer, and BufferPoolManager
+  correctness; a B+-tree randomized oracle test (20k ops) under real
+  eviction pressure; skip list, Bloom filter, SSTable, and merge-iterator
+  unit tests; an LSM-tree randomized oracle test (20k ops, background
+  compaction racing foreground operations) plus a flush-and-compaction
+  demo proving SSTables actually get created and merged under load.
+- Google Benchmark suites: disk I/O; a Zipfian LRU-K-vs-LRU hit-rate curve;
+  B+-tree point-lookup/range-scan/insert-throughput at 1M/10M keys; and a
+  head-to-head B+-tree-vs-LSM-tree comparison (throughput, latency,
+  read/space amplification) swept across write-heavy to read-heavy
+  workloads, plus range-scan throughput.
 - GitHub Actions CI (build + test + CLI smoke test + Docker build) on every
   push.
 - Docker image that builds the engine and runs the CLI.
@@ -96,8 +104,8 @@ docker run --rm -it -v dbengine-data:/home/dbengine/data dbengine
 
 0. Scaffolding, Disk Manager, CI & Docker
 1. Buffer Pool Manager (LRU-K eviction)
-2. Engine A: disk-backed B+-tree *(current)*
-3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters)
+2. Engine A: disk-backed B+-tree
+3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters) *(current)*
 4. Write-ahead log & ARIES-style crash recovery
 5. MVCC concurrency (snapshot isolation)
 6. SQL front-end & cost-based optimizer

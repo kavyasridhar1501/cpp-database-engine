@@ -196,3 +196,106 @@ hardware claim):
   degrade much less with N, since it doesn't need to touch the on-disk
   structure at all for most writes. That comparison is the Phase 3
   deliverable.
+
+## Phase 3 — Head-to-Head: B+-Tree vs. LSM-Tree
+
+**What's measured:** both engines, populated with the same 100,000 keys
+(shuffled insertion order, same methodology as Phase 2) and the same
+buffer-pool budget (2,000 frames for the B+-tree; the LSM-tree's SSTables
+each get their own small 8-frame pool — see DESIGN.md), then driven through
+a Zipfian-distributed (skew 0.99) mixed read/write workload swept across
+write fractions from 5% to 90%, plus a dedicated range-scan workload
+(500 scans of a 100-key window from random start points). Reported per
+point: throughput, average latency, disk reads per operation ("read
+amplification"), and total on-disk bytes versus the logical dataset size
+("space amplification").
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='MixedWorkload|RangeScan_(BPlusTree|LSM)'
+```
+
+**Results** (4-core sandbox, same caveats as earlier phases):
+
+| Write % | B+-tree ops/s | LSM ops/s | B+-tree reads/op | LSM reads/op |
+|--------:|--------------:|----------:|-----------------:|-------------:|
+| 5       | 541k          | 1.19M     | 0.106            | 0.401        |
+| 10      | 538k          | 1.27M     | 0.106            | 0.370        |
+| 30      | 560k          | 1.50M     | 0.106            | 0.263        |
+| 50      | 550k          | 1.58M     | 0.106            | 0.198        |
+| 70      | 550k          | 1.85M     | 0.106            | 0.119        |
+| 90      | 530k          | 1.97M     | 0.106            | 0.042        |
+
+| Write % | B+-tree space amp | LSM space amp |
+|--------:|-------------------:|---------------:|
+| 5–30    | 7.56×               | 4.84×           |
+| 50–70   | 7.56×               | 5.34×           |
+| 90      | 7.56×               | 5.64×           |
+
+Range scan (100-key window, random start): B+-tree 51.8k scans/s (1.238
+disk reads/scan), LSM 88.2k scans/s (3.852 disk reads/scan).
+
+**Takeaways:**
+- **No throughput crossover in this range — the LSM-tree wins outright at
+  every write fraction tested**, and the gap *widens* as writes increase
+  (1.19M → 1.97M ops/s for the LSM-tree, essentially flat at ~530-560k for
+  the B+-tree). This is the direct, expected consequence of the two
+  write paths: a B+-tree write is a tree descent plus (at this buffer-pool
+  size) real page I/O, roughly constant cost regardless of what fraction of
+  the workload is writes; an LSM-tree write is an in-memory skip-list
+  insert that's O(1) amortized against disk (cost is paid later, in bulk,
+  at flush/compaction time). At no point in the 5-90% range does adding
+  more writes hurt the LSM-tree's throughput — if anything it helps, since
+  fewer of the ops are the (relatively) more expensive multi-SSTable reads.
+- **The classic B+-tree/LSM-tree crossover shows up clearly in read
+  amplification instead, and it *does* cross within the tested range.**
+  The B+-tree's disk-reads-per-op is flat at ~0.106 regardless of workload
+  mix (a lookup always costs the same tree descent). The LSM-tree's is
+  workload-dependent: 0.401 reads/op at 5% writes (mostly reads, each one
+  potentially checking several SSTables past the memtable) down to 0.042 at
+  90% writes (mostly writes, which are memtable-only; the few reads that do
+  happen more often hit the memtable or the first SSTable checked). The two
+  lines cross somewhere around 75-85% writes — below that, the LSM-tree
+  reads more pages per operation than the B+-tree does; above it, fewer.
+  This is the textbook LSM trade-off (cheap writes, potentially-amplified
+  reads) made directly measurable, and it's *why* Bloom filters matter: at
+  5% writes the LSM-tree is still only touching 0.4 pages/op on average
+  across however many SSTables exist, because a Bloom filter miss costs
+  nothing (a bit-array check, no disk I/O) — without it, this number would
+  be far higher and the crossover point would shift well to the right.
+- **Space amplification is higher for the B+-tree (7.56×) than the
+  LSM-tree (4.84-5.64×) at every write fraction, and for a specific,
+  identifiable reason, not because one engine is "worse."** Both engines
+  pay the same fixed-size-value tax documented in DESIGN.md (every ~8-byte
+  test value padded to a 64-byte slot) — that alone accounts for roughly
+  4-5× of both numbers. The B+-tree's *additional* overhead beyond that
+  comes from page fill factor: random-order inserts and B-tree splits
+  leave leaf pages roughly 65-70% full on average (a well-known property of
+  B-trees under random insertion), whereas the LSM-tree's SSTable builder
+  bulk-packs sorted data into pages at essentially 100% fill (only the last
+  page of a run is ever partially empty). That fill-factor gap is a real,
+  structural LSM advantage — bulk-sorted writes pack tighter than
+  incremental random-order ones — independent of the fixed-value-size tax
+  both engines share.
+- **LSM space amplification grows with write fraction** (4.84× at 5% writes
+  → 5.64× at 90%), which is exactly the expected LSM behavior: more writes
+  mean more not-yet-compacted data sitting in tier 0 at any given moment
+  (updates to existing keys leave stale copies behind until compaction
+  removes them), so space amplification is a function of write load, not a
+  fixed constant — unlike the B+-tree, where it's roughly workload-
+  independent (updates overwrite in place; the tree's shape barely changes).
+- **Range scan: the LSM-tree is faster in raw throughput (88.2k vs. 51.8k
+  scans/s) despite reading more disk pages per scan (3.852 vs. 1.238).**
+  This looks counter-intuitive but has a specific cause: a single LSM scan
+  fans out across the memtable and multiple SSTables simultaneously (the
+  merge iterator holds one cursor per source), so "disk reads per scan"
+  counts touches across several small, page-cache-friendly per-SSTable
+  pools rather than one larger shared pool — more total page touches, but
+  each one cheaper on average given the sandbox's warm OS page cache. This
+  is more a statement about this benchmark's scale (100k keys, few tiers)
+  and the sandbox environment than a general claim that LSM range scans are
+  always faster; the more SSTables accumulate before compaction catches
+  up, the more cursors a scan fans out across, and that trend would
+  eventually reverse this result at larger scale or under heavier write
+  load — a good candidate for a deeper follow-up if this project continues
+  past its planned phases.

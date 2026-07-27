@@ -218,19 +218,158 @@ That's a real cost of a fixed buffer pool against a growing B+-tree, and a
 useful baseline for Phase 3, where an LSM-tree's memtable-then-flush write
 path is expected to degrade far less with scale.
 
+## Phase 3 — LSM-Tree (Engine B)
+
+**Skip list and Bloom filter are original implementations, not vendored
+code.** The hard constraints allow a vendored header-only skip list or
+Bloom filter; this project writes its own instead (`src/lsm/skip_list.h`,
+`src/lsm/bloom_filter.h`), consistent with "write our own code" and keeping
+the whole codebase auditable without a third-party dependency to reason
+about. The skip list follows Pugh (1990); the Bloom filter uses double
+hashing (Kirsch & Mitzenmacher, 2006) to derive k hash functions from two
+64-bit mixes instead of k independent hash functions.
+
+**SSTables reuse Phase 2's fixed-size-value discipline, and it shows up
+directly in the benchmark numbers.** An SSTable's data-page entries have
+the same layout as a B+-tree leaf entry (key + length + a `MAX_VALUE_SIZE`
+slot) for the same reason: fixed-size entries mean bulk-loading a sorted
+page is a flat array fill, no slotted-page free-space bookkeeping. The
+cost is real and visible: BENCHMARKS.md's space-amplification numbers are
+inflated for *both* engines by padding every value out to 64 bytes
+regardless of how many bytes it actually uses (our benchmark's values are
+~8 bytes). This is the same trade-off flagged in Phase 2, now paid a
+second time by the LSM-tree — a deliberate, documented consequence of
+keeping the two engines' storage format comparable rather than letting one
+quietly support more efficient variable-length values than the other.
+
+**Per-SSTable Bloom filter and sparse index are loaded fully into memory
+at `Open()`; only data pages go through a (small, per-SSTable) buffer
+pool.** An SSTable's index (one entry per data page) and Bloom filter are
+small and consulted on every lookup, so there's no reason to page them
+through a cache — they're parsed once into `std::vector`/`BloomFilter`
+objects and kept resident for the SSTable's lifetime. Data pages, which
+could be large, go through an actual `BufferPoolManager` so repeated reads
+of hot pages are still cached. Each SSTable gets its **own** small
+dedicated buffer pool (8 frames) rather than sharing one global cache
+across all SSTables, because `BufferPoolManager` is keyed by a single
+`DiskManager`/file (see Phase 1) and extending it to a shared cache across
+multiple files would mean re-keying frames by `(file, page_id)` — a real
+change to a component two phases old, out of scope here. This is a
+genuine simplification relative to production LSM engines (RocksDB's block
+cache is global, not per-SSTable); noted as a deferred improvement.
+
+**Each SSTable is its own file, deleted outright when compacted away —
+unlike every other "no free-page reuse yet" deferral in this project.**
+Phase 0-2 all defer *disk page* reuse because nothing yet both frees pages
+and needs the space back. Compaction is exactly that consumer, and since
+an SSTable already owns a whole file, the natural (and simplest correct)
+way to reclaim its space is to delete the file, not to recycle pages
+within a shared heap file. Lifetime is managed via `shared_ptr<SSTable>`:
+a compaction that supersedes a table calls `MarkObsolete()` and drops the
+engine's reference, but a concurrent reader that grabbed its own
+`shared_ptr` before the swap keeps the file alive (and only deletes it in
+the destructor, and only if it was marked obsolete) until it's done. This
+is what makes background compaction safe to run concurrently with reads
+without them ever seeing a half-deleted table.
+
+**Flush is synchronous; compaction is genuinely asynchronous (a real
+background thread), per the Phase 3 brief.** `Put`/`Delete` write into the
+active memtable and, if it crosses `memtable_flush_threshold_bytes`,
+build a brand-new SSTable *inline* on the caller's thread (holding the
+engine's mutex only briefly — to swap in a fresh empty memtable — not for
+the disk I/O itself, which proceeds against the old, now-unreachable
+memtable without blocking other operations). Compaction is different: a
+single dedicated thread wakes on a condition variable (or a 100ms poll,
+as a fallback) whenever a tier reaches `tier_compaction_threshold`
+SSTables, merges that tier's tables (a k-way merge over their sorted
+entries — see below), and promotes the result to the next tier. The
+tables being merged are immutable, so the merge itself runs *without*
+holding the engine's lock; the lock is only retaken briefly to install the
+result and retire the old tables. This mirrors why LSM-trees are
+compaction-friendly in the first place: nothing being read is ever being
+mutated.
+
+**Tombstones are dropped only when compacting the bottommost populated
+tier.** A delete can't touch older, already-written SSTables in place, so
+it's recorded as a tombstone entry that must keep shadowing any older
+value for that key until nothing older remains that it could still be
+shadowing. Compaction checks "does any tier below this one currently hold
+data?" before deciding a tombstone is safe to drop entirely; if there's
+anything below, the tombstone is written forward into the merged output
+instead. This is the same rule RocksDB uses (a compaction can drop a
+tombstone once it reaches, or is known to be at, the bottom of the LSM).
+
+**The merge iterator is one algorithm serving two callers, deliberately
+kept separate from tombstone policy.** `LSMMergeIterator` k-way-merges any
+set of priority-ordered cursors (a min-heap on (key, source priority)),
+producing one entry per distinct key — *including* tombstones — with the
+highest-priority source winning ties and every shadowed lower-priority
+entry silently discarded. `Scan()` wraps this with a filter that hides
+tombstones from callers (a `StorageIterator` should never surface a
+deleted key); compaction consumes the raw stream and decides per the rule
+above. Priority order is [memtable, tier 0 newest→oldest, tier 1
+newest→oldest, ...] for `Scan()`, and [tier newest→oldest] for a single
+tier's compaction merge — the same precedence `Get()` uses, so a point
+lookup and a range scan can never disagree about which source wins a key.
+
+**A real bug this surfaced: the background compaction thread can be
+starved by a very fast foreground write loop, growing a tier past its
+manifest capacity.** Under a tight, uncontended write loop (no I/O wait
+between calls), a non-fair mutex can consistently let the thread that just
+released a lock win the race to reacquire it over a thread parked on a
+condition variable — a classic convoy/starvation pattern. This showed up
+concretely: `LSMTreeEngineTest.RandomizedOperationsMatchStdMapOracle`
+(20,000 tight-loop ops) crashed roughly 1 run in 20 with "exceeded manifest
+per-tier SSTable capacity" because the compaction thread never got
+scheduled in time. The fix is backpressure, not a bigger capacity number:
+`kWriteStallTierSize` (comfortably below the hard manifest cap) is checked
+after every flush, and if crossed, the *writer* calls
+`CompactOneTierIfNeeded()` itself — the same method the background thread
+calls, guarded by a single `compaction_running_` flag so two callers never
+duplicate the same merge. This mirrors how production LSM engines handle
+the same problem (RocksDB's write stalls): if compaction can't keep up,
+the writer causing the backlog pays for it directly, which bounds tier
+growth regardless of how the OS happens to schedule the background thread.
+This is exactly the kind of bug a fixed-seed unit test won't reliably catch
+and a stress-repeated one will — worth remembering for Phase 5's MVCC work,
+which will have considerably more concurrency surface than this.
+
+**Manifest capacity is a fixed-size array (8 tiers × 16 SSTables/tier),
+not a growable log.** The manifest is one page: `next_sstable_id` plus,
+per tier, a count and an array of SSTable ids. This is enough headroom for
+any workload this project's tests/benchmarks generate (size-tiered
+compaction keeps steady-state occupancy per tier below the trigger
+threshold, itself well below the array capacity — see the backpressure
+mechanism above), but it is a real scale limit, not a real design: a
+production system would use a growable, append-only manifest log (exactly
+what RocksDB's `MANIFEST` file is). Flagged rather than fixed, since nothing
+in this project's scope exercises it.
+
+**No WAL yet for the LSM-tree either — same phased deferral as the
+B+-tree.** A crash mid-way loses whatever's in the active memtable since
+the last flush, which is the well-known reason real LSM engines pair a
+memtable with a parallel WAL. `LSMTreeEngine`'s destructor *does* flush a
+non-empty memtable on a clean shutdown (stopping the compaction thread
+first), so "close the engine, reopen it" behaves the same as the B+-tree
+engine for graceful shutdown — it's specifically crash durability that's
+deferred to Phase 4, uniformly across both engines.
+
 ## Deferred to later phases
 
-- Free-page reuse — Phase 3 (LSM) once compaction needs it; the B+-tree's
-  `DeletePage` already frees the buffer pool frame but page ids on disk are
-  still never recycled (same deferral as Phase 0/1, now also true of
-  `BPlusTree::Remove`'s merges).
+- Free-page reuse in `BPlusTree`'s on-disk page ids specifically (SSTables
+  solve their version of this by deleting whole files — see above).
+- A real WAL and crash recovery (Phase 4), for both engines uniformly.
 - Group commit / log-buffer batching for the WAL — Phase 4.
-- Per-page latching in `BufferPoolManager`, and latch crabbing in
-  `BPlusTree` (both currently one coarse mutex) — revisit under MVCC
-  (Phase 5) if contention measurements justify it.
+- Per-page latching in `BufferPoolManager`, latch crabbing in `BPlusTree`,
+  and finer-grained locking in `LSMTreeEngine` (all currently one coarse
+  mutex per structure) — revisit under MVCC (Phase 5) if contention
+  measurements justify it.
 - O(1)/O(log n) eviction for `LRUKReplacer`/`LRUReplacer` (currently linear
   scan) — revisit if buffer pool sizes grow enough to make it matter; the
   Phase 2 insert-throughput benchmark is partly bottlenecked on this (each
   eviction rescans up to 2,000 evictable frames).
+- A shared, global buffer pool cache across all of an LSM-tree's SSTables,
+  instead of one small pool per SSTable file.
+- A growable manifest log instead of a fixed-capacity manifest page.
 - Slotted pages / variable-length values for the B+-tree, if a future phase
   needs values larger than `MAX_VALUE_SIZE` without a separate heap page.
