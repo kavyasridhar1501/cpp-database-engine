@@ -97,7 +97,7 @@ bool Shell::ExecuteLine(const std::string& line, std::ostream& out) {
 }
 
 void Shell::Run() {
-  std::cout << "dbengine CLI (Phase 0: raw page access). Type 'help' for commands.\n";
+  std::cout << "dbengine CLI (raw page access). Type 'help' for commands.\n";
   std::string line;
   while (true) {
     std::cout << "db> ";

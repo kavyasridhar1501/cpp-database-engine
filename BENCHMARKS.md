@@ -57,3 +57,142 @@ across phases, not as an absolute performance claim.
   benchmark in Phase 1 (cache hit-rate curve vs. pool size) and the point
   lookup / insert throughput numbers in Phase 2 — both will be judged against
   "how much better than raw page I/O" rather than in isolation.
+
+## Phase 1 — Buffer Pool Manager (LRU-K vs. plain LRU)
+
+**What's measured:** cache hit rate as a function of buffer pool size (in
+frames), for `BufferPoolManager` configured with the production replacer
+(`LRUKReplacer`, k=2) versus the plain-LRU baseline (`LRUReplacer`), replaying
+the *same* fixed access trace through both. Each data point is a single
+deterministic replay (`->Iterations(1)`) against a fresh `DiskManager` file
+and fresh `BufferPoolManager` — no state carries over between pool sizes or
+between replacers.
+
+Two traces:
+- **`Zipfian`**: 200,000 accesses over 10,000 pages, Zipfian skew 0.99 (the
+  standard YCSB default) — a small set of pages absorbs most of the traffic,
+  matching real skewed key-popularity.
+- **`ZipfianWithScan`**: 100,000 Zipfian accesses over a 2,000-page hot set,
+  with a 300-page cold sequential scan (over a disjoint 2,000-page cold
+  range) injected every 2,000 accesses — the standard workload for exposing
+  a replacement policy's vulnerability to "sequential flooding" (O'Neil,
+  O'Neil & Weikum, SIGMOD 1993).
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='Zipfian'
+```
+
+**Results** (4-core sandbox, same caveats as Phase 0 — trend data, not a
+hardware claim):
+
+| Pool size | LRU-K hit rate | LRU hit rate | LRU-K advantage |
+|-----------|---------------:|-------------:|-----------------:|
+| 8         | 24.0%          | 10.4%        | +13.6 pts |
+| 16        | 31.4%          | 16.8%        | +14.6 pts |
+| 32        | 38.8%          | 24.5%        | +14.3 pts |
+| 64        | 46.2%          | 32.5%        | +13.7 pts |
+| 128       | 52.6%          | 40.6%        | +12.0 pts |
+| 256       | 58.5%          | 49.0%        | +9.5 pts |
+| 512       | 65.2%          | 57.6%        | +7.6 pts |
+| 1024      | 72.3%          | 66.5%        | +5.8 pts |
+| 2048      | 79.6%          | 75.9%        | +3.8 pts |
+
+*(pure Zipfian trace; `BM_Zipfian_LRUK` vs `BM_Zipfian_LRU`)*
+
+| Pool size | LRU-K hit rate | LRU hit rate | LRU-K advantage |
+|-----------|---------------:|-------------:|-----------------:|
+| 8         | 25.1%          | 12.6%        | +12.5 pts |
+| 16        | 33.2%          | 20.0%        | +13.2 pts |
+| 32        | 40.9%          | 28.2%        | +12.7 pts |
+| 64        | 47.8%          | 36.6%        | +11.2 pts |
+| 128       | 54.8%          | 45.0%        | +9.8 pts |
+| 256       | 61.7%          | 52.8%        | +8.9 pts |
+| 512       | 69.0%          | 60.5%        | +8.5 pts |
+| 1024      | 76.8%          | 70.5%        | +6.3 pts |
+
+*(Zipfian + periodic scan-pollution trace; `BM_ZipfianWithScan_LRUK` vs
+`BM_ZipfianWithScan_LRU`)*
+
+**Takeaways:**
+- LRU-K beats plain LRU at *every* pool size tested, on both traces — the
+  deliverable's "beat plain LRU on the same trace" bar is met without
+  qualification.
+- The advantage is largest at small pool sizes (roughly +13-15 points at
+  8-64 frames) and narrows as the pool gets large enough to hold most of the
+  hot set anyway (both policies converge toward the trace's inherent hit
+  ceiling). This matches the theory: LRU-K's edge comes from not letting a
+  single recent touch buy a page a spot in a scarce cache, and that edge
+  matters most exactly when the cache is scarce.
+- The scan-pollution trace doesn't show a *larger* gap than pure Zipfian
+  here — both traces show LRU-K winning by a similar margin — which is a bit
+  softer than the "LRU-K crushes LRU under scans" story sometimes told for
+  this workload. At these scan parameters (300-page scan every 2,000
+  accesses, hot set of only 2,000 pages) the scan isn't large or frequent
+  enough relative to the hot set to fully flush it under LRU either. A
+  bigger scan-to-hot-set ratio would likely widen the gap further; the
+  honest result here is that LRU-K wins clearly on both a plain skewed
+  workload and a scan-polluted one, without needing the scan to make its
+  case.
+- `BM_Zipfian_LRUK` runtime grows noticeably faster than `BM_Zipfian_LRU`'s
+  as pool size increases (63ms → 729ms from pool size 8 to 2048, vs. LRU's
+  roughly flat ~50-65ms). Both replacers scan their evictable set on every
+  eviction (see DESIGN.md), but LRU-K's per-frame work (deque bookkeeping,
+  the +inf/finite comparison) is heavier per element — a known, documented
+  scaling limitation, not a correctness issue, and irrelevant to the hit-rate
+  result above.
+
+## Phase 2 — B+-Tree (Engine A)
+
+**What's measured:** point-lookup latency, range-scan throughput, and
+insert throughput at 1M and 10M keys, via `BPlusTreeEngine` (the
+`StorageEngine` adapter). Keys are inserted in **shuffled**, not sequential,
+order for all three benchmarks — see DESIGN.md for why. The buffer pool is
+fixed at 2,000 frames (8MB) for both scales: ~10.5% of the 1M-key dataset
+(~76MB) but only ~1.05% of the 10M-key one (~760MB), i.e. an index that
+doesn't fit in RAM at either scale, and proportionally less of it fits as N
+grows.
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='PointLookup|RangeScan|InsertThroughput'
+```
+(The 10M-key insert-throughput run alone takes several minutes — filter it
+out with e.g. `--benchmark_filter='PointLookup|RangeScan'` for a quick
+check.)
+
+**Results** (4-core sandbox, same caveats as Phase 0/1 — trend data, not a
+hardware claim):
+
+| Benchmark | 1M keys | 10M keys |
+|---|---:|---:|
+| Point lookup (random key) | 23.5 µs/op (42.5k ops/s) | 25.8 µs/op (38.8k ops/s) |
+| Range scan (1,000-key window, random start) | 546 µs/scan (1.83M keys/s) | 599 µs/scan (1.67M keys/s) |
+| Insert throughput (fresh tree, shuffled keys) | 18.67 s total (53.6k ops/s) | 276.2 s total (36.2k ops/s) |
+
+**Takeaways:**
+- **Point lookup barely changes across a 10x increase in data** (23.5µs →
+  25.8µs, +10%) — this is the B+-tree's core promise showing up directly in
+  the numbers. A lookup costs one page fetch per tree level, tree height
+  grows logarithmically (both 1M and 10M keys fit in a 3-level tree at this
+  fanout), so the dominant cost per lookup — descending from root to leaf
+  under a mostly-cold buffer pool — is nearly flat regardless of N.
+- **Range scan is similarly flat** (1.83M → 1.67M keys/s) since it's
+  dominated by walking the leaf chain, a cost per key that doesn't depend
+  on tree depth at all.
+- **Insert throughput drops substantially at scale** (53.6k → 36.2k ops/s,
+  -32%) — unlike the two read paths, this one is *not* flat, and that's the
+  most interesting result in this section. The B+-tree's own algorithmic
+  cost per insert is still O(log N) (same shallow-tree argument as lookups),
+  so the slowdown isn't the tree getting structurally harder to navigate —
+  it's that the fixed 2,000-frame buffer pool is a shrinking fraction of a
+  growing dataset, so a larger share of each insert's page touches (finding
+  the leaf, touching siblings during a split, updating parent pointers)
+  miss the pool and pay for real page I/O plus an LRU-K eviction (itself an
+  O(pool size) linear scan — see DESIGN.md). This is a genuine cost of
+  pairing a fixed-size buffer pool with an ever-growing B+-tree, not a bug,
+  and it's the baseline Phase 3's LSM-tree needs to beat: an LSM's write
+  path (append to an in-memory memtable, flush when full) is expected to
+  degrade much less with N, since it doesn't need to touch the on-disk
+  structure at all for most writes. That comparison is the Phase 3
+  deliverable.

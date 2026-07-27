@@ -11,15 +11,32 @@ Built in phases, each with its own tests and benchmark numbers — see
 [DESIGN.md](DESIGN.md) for trade-off notes and [BENCHMARKS.md](BENCHMARKS.md)
 for results.
 
-## Status: Phase 0 — Scaffolding & Disk Manager
+## Status: Phase 2 — B+-Tree (Engine A)
 
 - `DiskManager` (`src/storage/disk/`): page-granular (4096-byte, fixed at
   compile time) reads/writes over a single heap file via `pread`/`pwrite`.
-- A minimal CLI shell (`alloc` / `write` / `read` / `stats`) for poking pages
-  by hand.
-- GoogleTest suite validating byte-for-byte read/write correctness,
-  zero-fill semantics, and persistence across reopen.
-- Google Benchmark suite for sequential vs. random page I/O.
+- `BufferPoolManager` (`src/buffer/`): fixed frames, pin/unpin, dirty-flag
+  write-back, pluggable eviction via a `Replacer` interface.
+  - `LRUKReplacer` (k=2) — the production eviction policy.
+  - `LRUReplacer` — a plain-LRU baseline kept only to benchmark against.
+- `StorageEngine` (`src/engine/`): the Get/Put/Delete/Scan interface both
+  storage engines implement identically.
+- `BPlusTree` / `BPlusTreeEngine` (`src/index/`): a disk-backed B+-tree
+  behind `StorageEngine` — page-overlaid leaf/internal node layouts, insert
+  with splits, delete with redistribute/merge, and a range-scan iterator
+  over the linked leaf chain. Root page id persists across reopen via a
+  metadata page.
+- A minimal CLI shell (`alloc` / `write` / `read` / `stats`) for poking raw
+  pages by hand.
+- GoogleTest suite: DiskManager byte-for-byte correctness, replacer eviction
+  order/tie-breaking for both policies, a BufferPoolManager randomized
+  stress test, and a B+-tree randomized insert/delete/lookup/scan test (20k
+  ops) validated against a `std::map` oracle under real buffer-pool eviction
+  pressure — plus deterministic split/merge/redistribute and
+  persist-across-reopen tests.
+- Google Benchmark suites: sequential vs. random page I/O; a Zipfian cache
+  hit-rate curve comparing LRU-K against plain LRU; and B+-tree
+  point-lookup/range-scan/insert-throughput at 1M and 10M keys.
 - GitHub Actions CI (build + test + CLI smoke test + Docker build) on every
   push.
 - Docker image that builds the engine and runs the CLI.
@@ -77,9 +94,9 @@ docker run --rm -it -v dbengine-data:/home/dbengine/data dbengine
 
 ## Roadmap
 
-0. Scaffolding, Disk Manager, CI & Docker *(current)*
-1. Buffer Pool Manager (CLOCK / LRU-K eviction)
-2. Engine A: disk-backed B+-tree
+0. Scaffolding, Disk Manager, CI & Docker
+1. Buffer Pool Manager (LRU-K eviction)
+2. Engine A: disk-backed B+-tree *(current)*
 3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters)
 4. Write-ahead log & ARIES-style crash recovery
 5. MVCC concurrency (snapshot isolation)
