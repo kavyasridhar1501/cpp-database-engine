@@ -354,22 +354,159 @@ first), so "close the engine, reopen it" behaves the same as the B+-tree
 engine for graceful shutdown — it's specifically crash durability that's
 deferred to Phase 4, uniformly across both engines.
 
+## Phase 4 — Write-Ahead Log & ARIES-Style Recovery
+
+**Logging is logical, not physical.** A production ARIES implementation
+usually logs physical (or physiological) before/after byte images of a
+page. This project logs at the level of the operation instead: an UPDATE
+record says "Put(key, new_value)" or "Delete(key)" happened, carrying
+whatever prior value undo would need to restore. Two things make this the
+right call here rather than a shortcut: every record becomes small and
+fixed-size (capped by `MAX_VALUE_SIZE`, the same constant that already
+bounds a B+-tree leaf entry and an SSTable entry — see Phase 2/3), so the
+WAL can reuse the exact "pack fixed-size records into pages" pattern
+already used everywhere else in this codebase, with no slotted-page
+framing to invent. More importantly, it's what the ARIES paper itself
+prescribes for tree-structured indexes specifically: a physical undo of "restore
+these exact bytes to this exact page" stops making sense once a
+subsequent split or merge has changed that page's layout, so B-tree
+operations need logical undo regardless. The trade-off this buys: replay
+must be deterministic (the same sequence of logical operations from the
+same starting state reconstructs the same tree — true here, since
+split/merge behavior is a pure function of `max_size_` and insertion
+history) and there's no per-page LSN stamping or dirty-page table, which
+is what makes the next few decisions possible.
+
+**No per-page LSNs, no dirty-page table — checkpoints are "sharp"
+instead.** Physical ARIES needs both because REDO must know, per page,
+exactly how far back it needs to start (the page's own LSN) and a
+"fuzzy" checkpoint (cheap, doesn't block writers) still needs the
+dirty-page table's recLSNs to bound REDO's start point correctly. This
+project doesn't track either. Instead, `DoCheckpoint()` calls
+`BufferPoolManager::FlushAllPages()` before recording anything — a
+synchronous, pause-the-world checkpoint that guarantees every committed
+change is durably on disk at that instant, except for transactions still
+active right then (which get recorded, by id and last LSN, in the
+checkpoint itself). That's a real cost (checkpointing gets slower as the
+buffer pool holds more dirty pages) traded for a recovery algorithm that
+doesn't need a second bookkeeping structure threaded through every page
+write. Worth revisiting if a later benchmark shows checkpoint pauses
+actually hurting foreground latency — nothing here does yet.
+
+**A bug the checkpoint pointer fixed: recovery time was bounded by total
+log size, not log-since-checkpoint — silently defeating the point of
+checkpointing.** The first working version of `RecoverOnStartup()` located
+the last checkpoint by scanning the *entire* log forward with
+`LogManager::ReadAll()`, and only then trimmed the actual Analysis/Redo
+work to start from that checkpoint. The trim was correct; the scan to
+find it wasn't bounded, and dominated recovery time for any log large
+enough to matter. The benchmark built specifically to show "checkpoints
+bound recovery time" (see BENCHMARKS.md) instead showed recovery time
+still scaling *linearly with total log size even with frequent
+checkpoints* — the fix was persisting the LSN of the most recent complete
+checkpoint's `CHECKPOINT_BEGIN` record in the engine's own metadata page
+(the same page that already holds the B+-tree's root page id), so
+recovery reads that one field, jumps straight to the checkpoint's small
+bracket via `LogManager::ReadRecord()`, and only then calls
+`ReadFrom(redo_start_lsn)` for the actual working set. This is the same
+category of "measurability caught a real gap" story as Phase 3's write-
+starvation bug: the benchmark wasn't just reporting a number, it falsified
+the design's central claim before the fix, which is exactly what it was
+built to do.
+
+**Undo is per-transaction and independent, not ARIES's globally
+LSN-interleaved order.** Real ARIES processes all losers' pending undo
+actions in strict descending LSN order, globally across transactions, because
+physical undo needs to respect page-latching dependencies between them. This
+project's undo is logical and key-scoped — one transaction's compensations
+never touch another transaction's bookkeeping — so undoing each loser
+transaction fully, one at a time, is still correct without that interleaving.
+Every compensating action writes a CLR (Compensation Log Record) carrying an
+`undo_next_lsn`, so an undo interrupted by a second crash resumes correctly:
+recovery's backward walk treats a CLR it encounters as "already done, skip to
+its `undo_next_lsn`" rather than redoing the compensation. The crash-injection
+harness's random kill points land mid-abort often enough across hundreds of
+runs to exercise this path empirically, not just in the two-crash unit test
+written for it directly.
+
+**The B+-tree gets the full ARIES treatment; the LSM-tree gets a smaller,
+deliberately asymmetric one.** `WALBPlusTreeEngine` adds explicit
+multi-operation transactions (`Begin`/`Put`/`Delete`/`Get`/`Commit`/`Abort`)
+specifically so `Abort` — and therefore recovery's Undo phase — has
+something real to demonstrate. `LSMTreeEngine`'s optional WAL (default
+off, preserving Phase 3's behavior for existing callers) is redo-only: log
+a Put/Delete before applying it to the memtable, replay on restart. There's
+no transaction concept, no undo, because there's nothing to undo — an
+SSTable is built atomically or not at all, and the memtable itself is pure
+in-memory state that a crash simply erases regardless of what a WAL says
+about it. The asymmetry mirrors what these two structures actually need
+protection from: the B+-tree mutates a shared on-disk structure in place
+(splits, merges, page overwrites) where "committed" vs. "not" is a real
+distinction worth transactions for; the LSM-tree's on-disk artifacts
+(SSTables) are already immutable and atomic by construction, and the only
+gap Phase 3 left was "durability for whatever's still sitting in the
+memtable" — which a plain append-and-replay log closes completely on its
+own.
+
+**A second correctness bug the memtable WAL's design specifically avoids:
+truncating a single shared log file races against concurrent writers.**
+The first design considered was one WAL file for the active memtable,
+truncated and restarted every time a flush completed. That has a real data-
+loss window: between swapping in a fresh empty memtable and that flush's
+SSTable build finishing, a *different* write landing in the new memtable
+would log to the *same* file, and then get silently discarded when the
+flush's truncation ran. The fix (implemented, not just noted) is a
+per-generation WAL file — `db_path + ".memwal" + generation` — rotated
+atomically with the memtable swap, so a flush only ever deletes the file
+for the generation it just durably flushed, never the one concurrent
+writes are now using. Recovery replays every generation file it finds
+(there's normally at most one; a crash mid-flush can leave two) in
+ascending order into a fresh memtable, immediately re-logging that
+replayed data into a new generation so it stays protected until the next
+flush.
+
+**The crash-injection harness uses a real `fork`/`SIGKILL`, not an
+in-process simulation, and that distinction mattered while building the
+test oracle.** A C++ object going out of scope inside the same process
+always runs its destructor — for `LSMTreeEngine` that means a graceful
+final flush regardless of whether WAL is enabled, which would make an
+in-process "simulated crash" incapable of ever proving the WAL did
+anything (the graceful path saves the data either way). The harness
+instead forks a real worker process, lets it run unpaced for a random
+1-50ms, and sends `SIGKILL` — nothing runs on the way out. Building the
+oracle for this surfaced its own subtlety: a worker that logs "commit
+confirmed" to a side file *after* the engine call returns has a race (the
+process can be killed between the engine call succeeding and that log
+line reaching disk), which showed up immediately as spurious failures —
+"key present in the DB but not confirmed in the side log" — that looked
+like an engine bug but was the test oracle's own gap. The fix is
+bracketing every attempt with an 'A' (before) and 'C' (after) line, both
+individually fsynced: at most one *trailing* bracket in the file can be
+left dangling (an 'A' with no matching 'C'), and only that one key's
+outcome is genuinely ambiguous — every other key's last 'C' value must
+match the DB exactly. See `test/crash/crash_recovery_test.cpp`.
+
 ## Deferred to later phases
 
 - Free-page reuse in `BPlusTree`'s on-disk page ids specifically (SSTables
   solve their version of this by deleting whole files — see above).
-- A real WAL and crash recovery (Phase 4), for both engines uniformly.
-- Group commit / log-buffer batching for the WAL — Phase 4.
+- Group commit / log-buffer batching for the WAL — logging currently fsyncs
+  once per commit (see BENCHMARKS.md for the throughput cost this carries);
+  batching multiple transactions' commits into one fsync is the standard
+  next step if that cost needs to come down.
 - Per-page latching in `BufferPoolManager`, latch crabbing in `BPlusTree`,
-  and finer-grained locking in `LSMTreeEngine` (all currently one coarse
-  mutex per structure) — revisit under MVCC (Phase 5) if contention
-  measurements justify it.
+  and finer-grained locking in `LSMTreeEngine`/`WALBPlusTreeEngine` (all
+  currently one coarse mutex per structure) — revisit under MVCC (Phase 5)
+  if contention measurements justify it.
 - O(1)/O(log n) eviction for `LRUKReplacer`/`LRUReplacer` (currently linear
   scan) — revisit if buffer pool sizes grow enough to make it matter; the
   Phase 2 insert-throughput benchmark is partly bottlenecked on this (each
   eviction rescans up to 2,000 evictable frames).
 - A shared, global buffer pool cache across all of an LSM-tree's SSTables,
   instead of one small pool per SSTable file.
-- A growable manifest log instead of a fixed-capacity manifest page.
+- A growable manifest log instead of a fixed-capacity manifest page (LSM
+  tier manifest) / fixed-capacity checkpoint bracket (WAL).
 - Slotted pages / variable-length values for the B+-tree, if a future phase
   needs values larger than `MAX_VALUE_SIZE` without a separate heap page.
+- Fuzzy (non-blocking) checkpoints for the WAL, if sharp checkpoints'
+  pause-the-world cost ever shows up as a real foreground-latency problem.

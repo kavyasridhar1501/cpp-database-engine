@@ -11,6 +11,8 @@ add_library(dbengine_core
   lsm/sstable.cpp
   lsm/merge_iterator.cpp
   lsm/lsm_tree_engine.cpp
+  wal/log_manager.cpp
+  wal/wal_b_plus_tree_engine.cpp
 )
 
 target_include_directories(dbengine_core

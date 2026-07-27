@@ -11,7 +11,7 @@ Built in phases, each with its own tests and benchmark numbers — see
 [DESIGN.md](DESIGN.md) for trade-off notes and [BENCHMARKS.md](BENCHMARKS.md)
 for results.
 
-## Status: Phase 3 — LSM-Tree (Engine B)
+## Status: Phase 4 — Write-Ahead Log & ARIES-Style Recovery
 
 - `DiskManager` (`src/storage/disk/`): page-granular (4096-byte, fixed at
   compile time) reads/writes over a single heap file via `pread`/`pwrite`.
@@ -32,19 +32,29 @@ for results.
   write-side backpressure so a fast writer can't starve it — see
   DESIGN.md), and a k-way merge iterator over the memtable and every live
   SSTable for reads and range scans.
+- `LogManager` / `WALBPlusTreeEngine` (`src/wal/`): an append-only,
+  page-based write-ahead log and an ARIES-lite recovery layer on top of the
+  B+-tree — explicit multi-operation transactions
+  (Begin/Put/Delete/Get/Commit/Abort), logical redo/undo with Compensation
+  Log Records, sharp periodic checkpoints, and Analysis→Redo→Undo restart
+  recovery that jumps straight to the last checkpoint instead of scanning
+  the whole log. `LSMTreeEngine` gets a smaller, optional redo-only WAL for
+  its memtable (no transactions/undo needed — see DESIGN.md for why).
 - A minimal CLI shell (`alloc` / `write` / `read` / `stats`) for poking raw
   pages by hand.
-- GoogleTest suite (81 tests): DiskManager, replacer, and BufferPoolManager
-  correctness; a B+-tree randomized oracle test (20k ops) under real
-  eviction pressure; skip list, Bloom filter, SSTable, and merge-iterator
-  unit tests; an LSM-tree randomized oracle test (20k ops, background
-  compaction racing foreground operations) plus a flush-and-compaction
-  demo proving SSTables actually get created and merged under load.
+- GoogleTest suite (106 tests): DiskManager, replacer, BufferPoolManager,
+  B+-tree, LSM-tree, and WAL/recovery correctness, including randomized
+  oracle tests for each engine; a `LogManager` test suite; a
+  `WALBPlusTreeEngine` suite covering transactions, live abort/undo,
+  checkpointing, and simulated-crash recovery; and a **crash-injection
+  harness** that forks a real worker process, `SIGKILL`s it at a random
+  point, and verifies recovered state against an independent oracle — 150
+  cycles against the B+-tree, 100 against the LSM-tree, every push.
 - Google Benchmark suites: disk I/O; a Zipfian LRU-K-vs-LRU hit-rate curve;
-  B+-tree point-lookup/range-scan/insert-throughput at 1M/10M keys; and a
-  head-to-head B+-tree-vs-LSM-tree comparison (throughput, latency,
-  read/space amplification) swept across write-heavy to read-heavy
-  workloads, plus range-scan throughput.
+  B+-tree point-lookup/range-scan/insert-throughput at 1M/10M keys; a
+  head-to-head B+-tree-vs-LSM-tree comparison across write-heavy to
+  read-heavy workloads; and WAL recovery-time-vs-log-size (with and without
+  checkpointing) plus WAL-on-vs-off throughput cost.
 - GitHub Actions CI (build + test + CLI smoke test + Docker build) on every
   push.
 - Docker image that builds the engine and runs the CLI.
@@ -105,8 +115,8 @@ docker run --rm -it -v dbengine-data:/home/dbengine/data dbengine
 0. Scaffolding, Disk Manager, CI & Docker
 1. Buffer Pool Manager (LRU-K eviction)
 2. Engine A: disk-backed B+-tree
-3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters) *(current)*
-4. Write-ahead log & ARIES-style crash recovery
+3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters)
+4. Write-ahead log & ARIES-style crash recovery *(current)*
 5. MVCC concurrency (snapshot isolation)
 6. SQL front-end & cost-based optimizer
 7. Validation against SQLite, TPC-C/H-style workload

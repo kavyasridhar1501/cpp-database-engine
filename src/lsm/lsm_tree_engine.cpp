@@ -1,5 +1,7 @@
 #include "lsm/lsm_tree_engine.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -7,6 +9,7 @@
 
 #include "lsm/lsm_cursor.h"
 #include "lsm/merge_iterator.h"
+#include "wal/log_record.h"
 
 namespace dbengine {
 
@@ -51,12 +54,16 @@ class LSMScanIterator : public StorageIterator {
 }  // namespace
 
 LSMTreeEngine::LSMTreeEngine(const std::string& db_path, size_t memtable_flush_threshold_bytes,
-                             int tier_compaction_threshold)
+                             int tier_compaction_threshold, bool enable_wal)
     : db_path_(db_path),
       flush_threshold_bytes_(memtable_flush_threshold_bytes),
-      tier_threshold_(tier_compaction_threshold) {
+      tier_threshold_(tier_compaction_threshold),
+      wal_enabled_(enable_wal) {
   LoadManifestOrInitialize();
   active_memtable_ = std::make_shared<MemTable>();
+  if (wal_enabled_) {
+    RecoverMemWALOnStartup();
+  }
   compaction_thread_ = std::thread(&LSMTreeEngine::CompactionLoop, this);
 }
 
@@ -75,6 +82,66 @@ LSMTreeEngine::~LSMTreeEngine() {
 
 std::string LSMTreeEngine::SSTablePath(int64_t id) const {
   return db_path_ + ".sst" + std::to_string(id);
+}
+
+std::string LSMTreeEngine::MemWALPath(int64_t generation) const {
+  return db_path_ + ".memwal" + std::to_string(generation);
+}
+
+void LSMTreeEngine::RecoverMemWALOnStartup() {
+  // Discover any generation files a crash left behind. Under normal
+  // operation there's at most one (the currently-active generation); a
+  // crash mid-flush can leave two — the generation being flushed (not yet
+  // deleted, since deletion only happens after the SSTable build succeeds)
+  // and the generation swapped in to replace it. Replaying all of them, in
+  // ascending generation order, reconstructs the exact memtable state at
+  // crash time regardless of which case applies.
+  std::vector<int64_t> found_generations;
+  std::filesystem::path db_path(db_path_);
+  std::filesystem::path dir = db_path.parent_path();
+  if (dir.empty()) {
+    dir = ".";
+  }
+  std::string prefix = db_path.filename().string() + ".memwal";
+  if (std::filesystem::exists(dir)) {
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+      std::string fname = entry.path().filename().string();
+      if (fname.rfind(prefix, 0) != 0) continue;
+      std::string suffix = fname.substr(prefix.size());
+      if (!suffix.empty() &&
+          std::all_of(suffix.begin(), suffix.end(), [](unsigned char c) { return std::isdigit(c); })) {
+        found_generations.push_back(std::stoll(suffix));
+      }
+    }
+  }
+  std::sort(found_generations.begin(), found_generations.end());
+
+  int64_t new_generation = found_generations.empty() ? 0 : found_generations.back() + 1;
+  memtable_wal_ = std::make_unique<LogManager>(MemWALPath(new_generation));
+
+  for (int64_t gen : found_generations) {
+    LogManager old_wal(MemWALPath(gen));
+    for (const auto& rec : old_wal.ReadAll()) {
+      if (rec.op == LogOpType::PUT) {
+        active_memtable_->Put(rec.key, rec.NewValue());
+      } else if (rec.op == LogOpType::DELETE) {
+        active_memtable_->Delete(rec.key);
+      }
+      // Re-log into the fresh generation so this data stays crash-protected
+      // until the next flush, even though we just "replayed" rather than
+      // freshly wrote it.
+      memtable_wal_->Append(rec);
+    }
+  }
+  memtable_wal_->Flush();
+  for (int64_t gen : found_generations) {
+    std::filesystem::remove(MemWALPath(gen));
+  }
+  next_wal_generation_ = new_generation + 1;
+}
+
+size_t LSMTreeEngine::GetWALSizeBytes() const {
+  return wal_enabled_ ? memtable_wal_->GetLogSizeBytes() : 0;
 }
 
 void LSMTreeEngine::LoadManifestOrInitialize() {
@@ -129,12 +196,27 @@ void LSMTreeEngine::PersistManifestLocked() {
 
 void LSMTreeEngine::FlushActiveMemtable() {
   std::shared_ptr<MemTable> old;
+  std::string old_wal_path;
+  bool had_wal = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     old = active_memtable_;
     active_memtable_ = std::make_shared<MemTable>();
+    if (wal_enabled_) {
+      // Rotate to a fresh generation file *before* releasing the lock, so
+      // any write that lands in the new memtable concurrently with this
+      // flush is logged to the new generation, never the one about to be
+      // retired — see DESIGN.md for the data-loss race this avoids.
+      had_wal = true;
+      old_wal_path = MemWALPath(next_wal_generation_ - 1);  // set by the previous rotation/startup
+      int64_t new_generation = next_wal_generation_.fetch_add(1);
+      memtable_wal_ = std::make_unique<LogManager>(MemWALPath(new_generation));
+    }
   }
   if (old->EntryCount() == 0) {
+    if (had_wal) {
+      std::filesystem::remove(old_wal_path);
+    }
     return;
   }
 
@@ -149,6 +231,12 @@ void LSMTreeEngine::FlushActiveMemtable() {
   SSTable::Build(path, entries);
   auto sst = SSTable::Open(path);
   sst->SetId(id);
+
+  // The memtable's data is now durably in the SSTable; the old generation's
+  // WAL is no longer needed to protect it.
+  if (had_wal) {
+    std::filesystem::remove(old_wal_path);
+  }
 
   bool backlogged;
   {
@@ -311,6 +399,15 @@ void LSMTreeEngine::Put(KeyType key, const std::string& value) {
   bool need_flush;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (wal_enabled_) {
+      LogRecord rec;
+      rec.type = LogRecordType::UPDATE;
+      rec.op = LogOpType::PUT;
+      rec.key = key;
+      rec.SetNewValue(value);
+      memtable_wal_->Append(rec);
+      memtable_wal_->Flush();
+    }
     active_memtable_->Put(key, value);
     need_flush = active_memtable_->ApproximateSizeBytes() >= flush_threshold_bytes_;
   }
@@ -326,6 +423,14 @@ bool LSMTreeEngine::Delete(KeyType key) {
   bool need_flush;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (wal_enabled_) {
+      LogRecord rec;
+      rec.type = LogRecordType::UPDATE;
+      rec.op = LogOpType::DELETE;
+      rec.key = key;
+      memtable_wal_->Append(rec);
+      memtable_wal_->Flush();
+    }
     active_memtable_->Delete(key);
     need_flush = active_memtable_->ApproximateSizeBytes() >= flush_threshold_bytes_;
   }

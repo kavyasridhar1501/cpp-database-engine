@@ -299,3 +299,69 @@ disk reads/scan), LSM 88.2k scans/s (3.852 disk reads/scan).
   eventually reverse this result at larger scale or under heavier write
   load — a good candidate for a deeper follow-up if this project continues
   past its planned phases.
+
+## Phase 4 — Write-Ahead Log & ARIES-Style Recovery
+
+**What's measured:** (1) recovery time (the `WALBPlusTreeEngine` constructor's
+cost when reopening a database with an existing log) as a function of how
+much log exists to replay, with and without periodic checkpointing; (2) the
+throughput cost of running with the WAL on (every commit logs and fsyncs)
+versus off. All runs use a 64-frame buffer pool and a 1,000-key range (small
+enough that the tree itself stays cheap to touch — what's being varied is
+log size, not tree size).
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='RecoveryTime|PutThroughput'
+```
+
+**Results** (4-core sandbox, same caveats as earlier phases):
+
+| Log size (ops) | Recovery, no checkpoint | Recovery, checkpoint every 100 txns |
+|----------------:|------------------------:|--------------------------------------:|
+| 1,000           | 0.44 ms                 | 0.016 ms                              |
+| 5,000           | 1.93 ms                 | 0.015 ms                              |
+| 10,000          | 3.96 ms                 | 0.016 ms                              |
+| 20,000          | 8.93 ms                 | *(not swept — see below)*             |
+| 50,000          | 22.2 ms                 | *(not swept — see below)*             |
+
+*(The checkpointed sweep stops at 10,000 because, unlike the no-checkpoint
+variant, it needs one real commit — and one real fsync — per operation to
+make periodic checkpointing actually trigger; the no-checkpoint variant
+batches all its setup writes into a single transaction/commit precisely to
+avoid that cost and reach larger log sizes. Both are pre-crash setup cost,
+not part of what's timed.)*
+
+| | Ops/sec | Time for 2,000 Puts |
+|---|---:|---:|
+| WAL on (log + fsync every commit) | 9,659/s | 1,519 ms |
+| WAL off | 1,017,820/s | 1.96 ms |
+
+**Takeaways:**
+- **Recovery time scales linearly with log size when there's nothing to
+  bound it** (0.44ms → 22.2ms from 1,000 to 50,000 logged operations, ~50x
+  more log, ~50x more recovery time) — expected, since Redo replays every
+  UPDATE/CLR record from the redo-start point forward.
+- **With periodic checkpoints, recovery time is flat regardless of log
+  size** (0.015-0.016ms across the entire 1,000-10,000 sweep) — this is the
+  headline result this benchmark exists to produce, and getting it required
+  fixing a real bug first (see DESIGN.md): the initial implementation
+  correctly *replayed* only the log since the last checkpoint, but still
+  *located* that checkpoint by scanning the whole log from the start, so
+  recovery time was silently bounded by total log size regardless of how
+  often the engine checkpointed. This benchmark caught that directly — the
+  "with checkpoints" line was scaling linearly too, just like the
+  "without" line, which shouldn't happen if checkpointing is working. The
+  fix (persist the last checkpoint's LSN in the metadata page so recovery
+  can jump straight to it) turned this from a ~100-1400x-too-slow result
+  into the flat line above.
+- **The WAL's throughput cost is dominated by fsync, not logging itself**
+  — a ~105x difference between WAL on and off (9.66k vs. 1.02M ops/s) for
+  identical work, consistent with one fsync call per commit being far more
+  expensive than everything else Put() does combined (tree traversal,
+  in-memory log record construction, the actual insert). This is the
+  expected, textbook cost of the WAL protocol's durability guarantee — a
+  transaction isn't durable until its commit record is fsynced — and the
+  standard mitigation (not implemented here; see DESIGN.md) is group
+  commit: batching multiple transactions' commits into a single fsync so
+  concurrent commits share the cost instead of each paying for their own.
