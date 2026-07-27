@@ -5,6 +5,12 @@ add_executable(dbengine_tests
   buffer/buffer_pool_manager_test.cpp
   index/b_plus_tree_test.cpp
   index/b_plus_tree_engine_test.cpp
+  lsm/skip_list_test.cpp
+  lsm/bloom_filter_test.cpp
+  lsm/memtable_test.cpp
+  lsm/sstable_test.cpp
+  lsm/merge_iterator_test.cpp
+  lsm/lsm_tree_engine_test.cpp
 )
 
 target_include_directories(dbengine_tests
