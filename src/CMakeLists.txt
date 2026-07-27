@@ -1,0 +1,23 @@
+add_library(dbengine_core
+  storage/disk/disk_manager.cpp
+)
+
+target_include_directories(dbengine_core
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_executable(dbengine_cli
+  main.cpp
+  ${CMAKE_SOURCE_DIR}/cli/shell.cpp
+)
+
+target_include_directories(dbengine_cli
+  PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
+
+target_link_libraries(dbengine_cli
+  PRIVATE
+    dbengine_core
+)
