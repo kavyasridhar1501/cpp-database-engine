@@ -141,3 +141,58 @@ hardware claim):
   the +inf/finite comparison) is heavier per element — a known, documented
   scaling limitation, not a correctness issue, and irrelevant to the hit-rate
   result above.
+
+## Phase 2 — B+-Tree (Engine A)
+
+**What's measured:** point-lookup latency, range-scan throughput, and
+insert throughput at 1M and 10M keys, via `BPlusTreeEngine` (the
+`StorageEngine` adapter). Keys are inserted in **shuffled**, not sequential,
+order for all three benchmarks — see DESIGN.md for why. The buffer pool is
+fixed at 2,000 frames (8MB) for both scales: ~10.5% of the 1M-key dataset
+(~76MB) but only ~1.05% of the 10M-key one (~760MB), i.e. an index that
+doesn't fit in RAM at either scale, and proportionally less of it fits as N
+grows.
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='PointLookup|RangeScan|InsertThroughput'
+```
+(The 10M-key insert-throughput run alone takes several minutes — filter it
+out with e.g. `--benchmark_filter='PointLookup|RangeScan'` for a quick
+check.)
+
+**Results** (4-core sandbox, same caveats as Phase 0/1 — trend data, not a
+hardware claim):
+
+| Benchmark | 1M keys | 10M keys |
+|---|---:|---:|
+| Point lookup (random key) | 23.5 µs/op (42.5k ops/s) | 25.8 µs/op (38.8k ops/s) |
+| Range scan (1,000-key window, random start) | 546 µs/scan (1.83M keys/s) | 599 µs/scan (1.67M keys/s) |
+| Insert throughput (fresh tree, shuffled keys) | 18.67 s total (53.6k ops/s) | 276.2 s total (36.2k ops/s) |
+
+**Takeaways:**
+- **Point lookup barely changes across a 10x increase in data** (23.5µs →
+  25.8µs, +10%) — this is the B+-tree's core promise showing up directly in
+  the numbers. A lookup costs one page fetch per tree level, tree height
+  grows logarithmically (both 1M and 10M keys fit in a 3-level tree at this
+  fanout), so the dominant cost per lookup — descending from root to leaf
+  under a mostly-cold buffer pool — is nearly flat regardless of N.
+- **Range scan is similarly flat** (1.83M → 1.67M keys/s) since it's
+  dominated by walking the leaf chain, a cost per key that doesn't depend
+  on tree depth at all.
+- **Insert throughput drops substantially at scale** (53.6k → 36.2k ops/s,
+  -32%) — unlike the two read paths, this one is *not* flat, and that's the
+  most interesting result in this section. The B+-tree's own algorithmic
+  cost per insert is still O(log N) (same shallow-tree argument as lookups),
+  so the slowdown isn't the tree getting structurally harder to navigate —
+  it's that the fixed 2,000-frame buffer pool is a shrinking fraction of a
+  growing dataset, so a larger share of each insert's page touches (finding
+  the leaf, touching siblings during a split, updating parent pointers)
+  miss the pool and pay for real page I/O plus an LRU-K eviction (itself an
+  O(pool size) linear scan — see DESIGN.md). This is a genuine cost of
+  pairing a fixed-size buffer pool with an ever-growing B+-tree, not a bug,
+  and it's the baseline Phase 3's LSM-tree needs to beat: an LSM's write
+  path (append to an in-memory memtable, flush when full) is expected to
+  degrade much less with N, since it doesn't need to touch the on-disk
+  structure at all for most writes. That comparison is the Phase 3
+  deliverable.
