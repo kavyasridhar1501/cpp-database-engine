@@ -434,3 +434,62 @@ consistent with earlier phases' caveats about shared-CPU environments):
   increments` — proving first-committer-wins conflict detection actually
   prevents lost updates rather than just looking plausible under a
   throughput benchmark that never checks final state.
+
+## Phase 6 — SQL Front-End & Tiny Optimizer
+
+**What's measured:** the same logical query — "find the one row matching a
+given value" (point) and "find the ~100 rows in a given range" (range) —
+issued two ways against an otherwise-identical `BTREE`-backed table of `id
+INTEGER, tag INTEGER, payload TEXT`, where `id` (the primary key) and `tag`
+hold identical values by construction. `WHERE id = X` / `WHERE id >= X AND
+id < X+100` let the planner pick `POINT_LOOKUP`/`RANGE_SCAN`; `WHERE tag =
+X` / `WHERE tag >= X AND tag < X+100` are logically equivalent (same
+result set, same size) but `tag` isn't the primary key, so the planner has
+no index to use and falls back to `FULL_SCAN` — the only difference
+between each pair is which access path the planner chose. Swept across
+1,000 / 10,000 / 100,000 rows to show how the gap grows with table size.
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='PointLookup_.*Predicate|RangeScan_.*Predicate'
+```
+
+**Results** (4-core sandbox, same caveats as earlier phases):
+
+| Rows | Point, indexed (`id`) | Point, unindexed (`tag`) | Slowdown |
+|---:|---:|---:|---:|
+| 1,000 | 1.12 µs | 51.7 µs | 46x |
+| 10,000 | 2.13 µs | 869 µs | 408x |
+| 100,000 | 3.86 µs | 14,444 µs | 3,742x |
+
+| Rows | Range, indexed (`id`) | Range, unindexed (`tag`) | Slowdown |
+|---:|---:|---:|---:|
+| 1,000 | 14.4 µs | 66.8 µs | 4.6x |
+| 10,000 | 19.9 µs | 941 µs | 47x |
+| 100,000 | 29.6 µs | 16,358 µs | 553x |
+
+**Takeaways:**
+- **The indexed access paths grow slowly (roughly logarithmically) with
+  table size; the unindexed ones grow roughly linearly** — exactly the
+  shape the planner's access-path choice predicts. `POINT_LOOKUP` costs one
+  B+-tree descent (`O(log n)`) regardless of which row it's after;
+  `FULL_SCAN` costs a full pass over every row in the table
+  (`O(n)`) even though it's looking for exactly one. At 100,000 rows the
+  gap is already ~3,700x for a point query and ~550x for a bounded range —
+  and both ratios are still growing with `n`, not leveling off.
+- **This is the concrete payoff of Phase 6's planner, not just a
+  restatement of "indexes are faster."** The two queries in each pair are
+  the *same* logical request (same predicate shape, same result set,
+  same table) — the only thing that differs is which column the WHERE
+  clause happens to name. `PlanQuery` (`src/sql/planner.cpp`) is what
+  turns "does this predicate touch the primary key" into "which access
+  path to run," and this benchmark is what confirms that decision matters
+  by orders of magnitude rather than being a marginal optimization.
+- **The range-scan gap is smaller than the point-lookup gap at every row
+  count, which is expected, not a discrepancy.** `RANGE_SCAN` still pays
+  an `O(log n)` B+-tree descent to find its starting key, same as
+  `POINT_LOOKUP` — but then both the indexed and unindexed paths iterate
+  roughly the same ~100-row window, whereas `POINT_LOOKUP` only ever
+  touches one row while `FULL_SCAN` touches every row in the table. The
+  fixed ~100-row scan cost both paths share shrinks the *relative*
+  advantage of indexing without changing its direction.

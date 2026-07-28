@@ -14,6 +14,12 @@ add_library(dbengine_core
   wal/log_manager.cpp
   wal/wal_b_plus_tree_engine.cpp
   mvcc/mvcc_store.cpp
+  sql/lexer.cpp
+  sql/parser.cpp
+  sql/catalog.cpp
+  sql/planner.cpp
+  sql/executor.cpp
+  sql/database.cpp
 )
 
 target_include_directories(dbengine_core

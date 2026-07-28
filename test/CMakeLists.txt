@@ -32,6 +32,11 @@ add_executable(dbengine_tests
   wal/wal_b_plus_tree_engine_test.cpp
   crash/crash_recovery_test.cpp
   mvcc/mvcc_store_test.cpp
+  sql/lexer_test.cpp
+  sql/parser_test.cpp
+  sql/planner_test.cpp
+  sql/catalog_test.cpp
+  sql/database_test.cpp
 )
 
 target_include_directories(dbengine_tests

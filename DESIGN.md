@@ -628,6 +628,115 @@ per-transaction lock once safely looked up from its shard under
 `TxnShard::mutex`: no other thread can be concurrently mutating or erasing
 that same transaction.
 
+## Phase 6 — SQL Front-End & Tiny Optimizer
+
+**Every table shares one `StorageEngine` instance instead of getting its
+own file.** A real engine gives each table (and each index) its own
+B-tree/LSM-tree; that's substantial file/lifecycle management that has
+nothing to do with parsing or planning, which is this phase's actual
+subject. Instead, `Database` opens a single `StorageEngine` and every
+table's rows are namespaced inside its one `int64_t` keyspace: the top
+`kTableIdBits` (16) bits of the key hold a table id, the remaining 48 bits
+hold the row's primary key (`catalog.h`'s `EncodeKey`/`DecodeTableId`/
+`DecodeRowKey`). Ascending key order therefore groups each table's rows
+into one contiguous range, in table-id order — which is exactly what
+`Executor`'s range/full scans rely on: start a `Scan()` at the table's
+first key and stop the moment a decoded key's table id no longer matches,
+rather than needing any engine-level notion of "table boundary." The
+trade-off is real (at most `2^16` tables, `2^48` rows each — both
+generous here, but a real limit a production system wouldn't accept) and
+deliberate: it turns "give every table real isolation" into a non-problem
+for this phase, in the same spirit as Phase 4's sharp checkpoints trading
+checkpoint cost for a simpler recovery algorithm.
+
+**The primary key is the only column the planner can ever use as an
+index, because it's the only column backed by one — `KeyType` is a single
+`int64_t` across this entire project (`config.h`), so `CREATE TABLE`
+requires the first column to be `INTEGER` and treats it as the row's
+`StorageEngine` key.** This is the load-bearing simplification the whole
+"tiny optimizer" rests on: with exactly one indexed column, access-path
+selection collapses to three cases — an equality on the primary key
+(`POINT_LOOKUP`), a bound on the primary key (`RANGE_SCAN`), or neither
+(`FULL_SCAN`) — instead of the secondary-index and join-order search space
+a real optimizer's cost model has to explore. `PlanQuery` (`planner.cpp`)
+implements exactly those three cases: an `EQ` on the primary key wins
+outright (cheapest possible access path); otherwise every `LT`/`LE`/`GT`/
+`GE` bound on the primary key is intersected into one `[lo, hi]` range;
+otherwise it's a full scan. Every comparison not already implied by the
+chosen path — always *every* comparison, for `FULL_SCAN` — travels along
+as a residual filter the executor applies after fetching, so a plan is
+always correct even when it's not maximally selective (e.g. two
+contradictory bounds on the primary key still fetch the intersecting
+range and then filter it down to nothing).
+
+**No secondary indexes, so "planning" never has to consider more than one
+access path per table — that's the specific scope cut that keeps this a
+"tiny" optimizer rather than a real one**, and it's worth being explicit
+about what a real cost-based optimizer does that this one doesn't: choose
+among *multiple* candidate indexes by estimated selectivity, decide join
+order and join algorithm across multiple tables, and use cardinality
+estimates (histograms, sampling) rather than "primary key predicate present
+or not." None of that machinery has anywhere to attach without secondary
+indexes or multi-table queries, both explicitly out of scope here (see
+Deferred, below) — adding either is what would make "optimizer" stop
+needing the qualifier "tiny."
+
+**The grammar is a deliberately small subset: `CREATE TABLE` / `INSERT` /
+`SELECT` / `DELETE`, `WHERE` limited to an `AND`-conjunction of single
+column-vs-literal comparisons, no `UPDATE`, no `OR`, no joins, no
+subqueries, no aggregates.** `UPDATE` is absent by design, not oversight:
+every `StorageEngine::Put` (and therefore `EncodeKey`) is already an
+upsert, so re-`INSERT`ing an existing primary key overwrites the row —
+`DatabaseTest.UpdateSemanticsViaReinsert` locks that behavior in as a
+test rather than leaving it as an undocumented accident. `WHERE`'s
+restriction to an `AND`-only conjunction (no `OR`, no parenthesized
+sub-expressions) is what keeps `PlanQuery`'s bound-intersection logic a
+simple min/max fold instead of needing to reason about a full boolean
+expression tree — an `OR` between two primary-key bounds would need a
+*union* of ranges (or two separate scans), which is a reasonable next step
+but adds real complexity for a phase whose point is the planner's
+access-path decision, not its expression evaluator.
+
+**Row encoding is a fixed, non-nullable layout chosen to fit inside
+`MAX_VALUE_SIZE` (64 bytes) — the same cap both storage engines already
+enforce, now inherited by the SQL layer rather than worked around.** The
+primary key is never part of the encoded payload (it's already the
+`StorageEngine` key), which buys back 8 bytes of that budget for free.
+Remaining columns are encoded in schema order: `INTEGER` as 8 raw bytes,
+`TEXT` as a 2-byte length prefix plus its bytes (`EncodeRow`/`DecodeRow` in
+`catalog.cpp`). `Database::ExecuteInsert` raises a `SqlException` — not a
+generic `IOException` from deep inside the storage layer — the moment a
+row would exceed the cap, so the error is legible at the SQL layer where
+the user's statement is visible, not several layers down inside a `Put()`
+call whose caller no longer has the original values in scope.
+
+**The catalog is in-memory only and does not persist across a `Database`
+being destroyed and reconstructed on the same file.** This is a real,
+intentional scope cut for this phase, not an oversight: the alternative
+(persisting table schemas as their own small metadata structure,
+presumably page 0 of the shared engine, mirroring how `BPlusTreeEngine`
+already persists its root page id there) is a well-understood, mechanical
+addition that adds file-format work orthogonal to parsing/planning/
+execution — this phase's actual subject — and is listed under Deferred
+below rather than built speculatively. Concretely: the row data itself
+*is* durable (the underlying `StorageEngine` is disk-backed, same as
+every other phase), but interpreting it correctly again requires
+re-issuing the same `CREATE TABLE` statements in the same order within a
+new `Database` instance, so table ids line up with what's already on disk.
+Every test and the CLI's `sql` command only ever use a `Database` within
+one process lifetime, so this doesn't block correctness demonstration —
+it's a forward-looking gap, not a silent one.
+
+**The CLI's `sql` command uses a separate file (`db_path + ".sql"`), never
+the same file the raw `alloc`/`write`/`read` commands touch.** Those
+commands write directly through `DiskManager` with no notion of the SQL
+layer's table-id key-prefixing scheme; sharing a file would let the two
+corrupt each other's data silently (a raw `write` landing on a page the
+SQL layer's B+-tree considers its own, or vice versa). Keeping them on
+separate files is the same reasoning that keeps a WAL in its own
+`.wal`-suffixed file rather than interleaving log records into the data
+file's own page space.
+
 ## Deferred to later phases
 
 - Free-page reuse in `BPlusTree`'s on-disk page ids specifically (SSTables
@@ -661,3 +770,24 @@ that same transaction.
   needs values larger than `MAX_VALUE_SIZE` without a separate heap page.
 - Fuzzy (non-blocking) checkpoints for the WAL, if sharp checkpoints'
   pause-the-world cost ever shows up as a real foreground-latency problem.
+- A persisted catalog (table schemas surviving a `Database` restart on the
+  same file) — see the Phase 6 section above for exactly what re-opening
+  requires without it.
+- Secondary indexes, `UPDATE`, `OR`/parenthesized `WHERE` expressions,
+  joins, aggregates, and NULL-able columns in the SQL layer — see the
+  Phase 6 section above for why each was cut and what it would take to add.
+  Secondary indexes specifically are the one that would change the
+  optimizer from "tiny" to something closer to real: with more than one
+  indexed column per table, `PlanQuery` would need actual cost comparison
+  between candidate access paths instead of "is there a primary-key
+  predicate or not."
+- One `StorageEngine`/file per SQL table instead of the shared, table-id-
+  prefixed keyspace every table currently lives in — see the Phase 6
+  section above for the capacity limits that trade-off accepts.
+- Transactional SQL statements (wrapping the SQL layer's `Insert`/`Delete`
+  in `WALBPlusTreeEngine`- or `MVCCStore`-style `Begin`/`Commit`/`Abort`,
+  giving multi-statement atomicity, isolation, and crash recovery to the
+  SQL front-end) — Phases 4 and 5 built both underlying mechanisms; wiring
+  either into the SQL layer is a natural but nontrivial follow-up this
+  phase deliberately left for later so it could focus on parsing and
+  planning.
