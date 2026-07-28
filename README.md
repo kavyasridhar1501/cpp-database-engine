@@ -84,6 +84,22 @@ $ ./build/benchmark/dbengine_bench --benchmark_filter='PointLookup_.*Predicate'
 
 ![Indexed vs unindexed point lookup, same query, same table](docs/screenshots/optimizer-benchmark.png)
 
+### MVCC write skew: appears under `SNAPSHOT`, vanishes under `SERIALIZABLE_SNAPSHOT`
+
+```
+$ ./build/test/dbengine_tests --gtest_filter='MVCCStoreTest.WriteSkew*' -v
+```
+
+![Write skew demonstrated under SNAPSHOT and prevented under SERIALIZABLE_SNAPSHOT](docs/screenshots/mvcc-write-skew.png)
+
+### Differential testing against real SQLite
+
+```
+$ ./build/test/dbengine_tests --gtest_filter='*SqliteDifferentialTest*' -v
+```
+
+![Identical SQL run against this engine and a real SQLite, results compared directly](docs/screenshots/sqlite-differential-tests.png)
+
 ## Features
 
 - Two storage engines behind one `StorageEngine` interface: a disk-backed
