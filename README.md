@@ -38,11 +38,9 @@ not derived from BusTub.
 
 ## Demo
 
-No GUI. This is a systems project, not a product. Here's what using it
-looks like end to end.
-
-Results page (headline benchmark numbers), published via GitHub Pages:
-**[kavyasridhar1501.github.io/cpp-database-engine](https://kavyasridhar1501.github.io/cpp-database-engine/)**
+No GUI, no hosted instance. This is a systems project, run it locally.
+See [Installation / Setup](#installation--setup) and [Usage](#usage) below
+for the exact steps.
 
 SQL shell:
 ```
@@ -84,8 +82,8 @@ $ curl 'http://localhost:8080/query?sql=SELECT%20*%20FROM%20users%20WHERE%20id%2
   clause. Worth ~3,700x at 100k rows in the benchmark that proves it.
 - Differential testing against a real SQLite, plus TPC-C/TPC-H-inspired
   workloads, for validation beyond this project's own test suite.
-- A read-only HTTP API and a published container image. See
-  [Usage](#usage) and [Deployment](#deployment).
+- A read-only HTTP API and a Docker image you can build and run locally.
+  See [Usage](#usage).
 
 ## Tech stack
 
@@ -97,7 +95,7 @@ $ curl 'http://localhost:8080/query?sql=SELECT%20*%20FROM%20users%20WHERE%20id%2
 | Benchmarking | Google Benchmark |
 | Validation oracle (test-only) | SQLite3, linked via `find_package`, never shipped in the engine |
 | Networking | Raw POSIX sockets, no web framework |
-| CI/CD | GitHub Actions, GHCR, GitHub Pages |
+| CI | GitHub Actions (build + test on every push) |
 | Containerization | Docker, multi-stage build |
 
 No external database libraries, ORMs, or storage-engine dependencies in
