@@ -299,3 +299,197 @@ disk reads/scan), LSM 88.2k scans/s (3.852 disk reads/scan).
   eventually reverse this result at larger scale or under heavier write
   load — a good candidate for a deeper follow-up if this project continues
   past its planned phases.
+
+## Phase 4 — Write-Ahead Log & ARIES-Style Recovery
+
+**What's measured:** (1) recovery time (the `WALBPlusTreeEngine` constructor's
+cost when reopening a database with an existing log) as a function of how
+much log exists to replay, with and without periodic checkpointing; (2) the
+throughput cost of running with the WAL on (every commit logs and fsyncs)
+versus off. All runs use a 64-frame buffer pool and a 1,000-key range (small
+enough that the tree itself stays cheap to touch — what's being varied is
+log size, not tree size).
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='RecoveryTime|PutThroughput'
+```
+
+**Results** (4-core sandbox, same caveats as earlier phases):
+
+| Log size (ops) | Recovery, no checkpoint | Recovery, checkpoint every 100 txns |
+|----------------:|------------------------:|--------------------------------------:|
+| 1,000           | 0.44 ms                 | 0.016 ms                              |
+| 5,000           | 1.93 ms                 | 0.015 ms                              |
+| 10,000          | 3.96 ms                 | 0.016 ms                              |
+| 20,000          | 8.93 ms                 | *(not swept — see below)*             |
+| 50,000          | 22.2 ms                 | *(not swept — see below)*             |
+
+*(The checkpointed sweep stops at 10,000 because, unlike the no-checkpoint
+variant, it needs one real commit — and one real fsync — per operation to
+make periodic checkpointing actually trigger; the no-checkpoint variant
+batches all its setup writes into a single transaction/commit precisely to
+avoid that cost and reach larger log sizes. Both are pre-crash setup cost,
+not part of what's timed.)*
+
+| | Ops/sec | Time for 2,000 Puts |
+|---|---:|---:|
+| WAL on (log + fsync every commit) | 9,659/s | 1,519 ms |
+| WAL off | 1,017,820/s | 1.96 ms |
+
+**Takeaways:**
+- **Recovery time scales linearly with log size when there's nothing to
+  bound it** (0.44ms → 22.2ms from 1,000 to 50,000 logged operations, ~50x
+  more log, ~50x more recovery time) — expected, since Redo replays every
+  UPDATE/CLR record from the redo-start point forward.
+- **With periodic checkpoints, recovery time is flat regardless of log
+  size** (0.015-0.016ms across the entire 1,000-10,000 sweep) — this is the
+  headline result this benchmark exists to produce, and getting it required
+  fixing a real bug first (see DESIGN.md): the initial implementation
+  correctly *replayed* only the log since the last checkpoint, but still
+  *located* that checkpoint by scanning the whole log from the start, so
+  recovery time was silently bounded by total log size regardless of how
+  often the engine checkpointed. This benchmark caught that directly — the
+  "with checkpoints" line was scaling linearly too, just like the
+  "without" line, which shouldn't happen if checkpointing is working. The
+  fix (persist the last checkpoint's LSN in the metadata page so recovery
+  can jump straight to it) turned this from a ~100-1400x-too-slow result
+  into the flat line above.
+- **The WAL's throughput cost is dominated by fsync, not logging itself**
+  — a ~105x difference between WAL on and off (9.66k vs. 1.02M ops/s) for
+  identical work, consistent with one fsync call per commit being far more
+  expensive than everything else Put() does combined (tree traversal,
+  in-memory log record construction, the actual insert). This is the
+  expected, textbook cost of the WAL protocol's durability guarantee — a
+  transaction isn't durable until its commit record is fsynced — and the
+  standard mitigation (not implemented here; see DESIGN.md) is group
+  commit: batching multiple transactions' commits into a single fsync so
+  concurrent commits share the cost instead of each paying for their own.
+
+## Phase 5 — MVCC Concurrency
+
+**What's measured:** throughput (autocommit ops/sec) of `MVCCStore` under an
+80% read / 20% write point-workload over 10,000 keys, swept across 1, 2, and
+4 threads (this sandbox's full `nproc`), each thread running its own
+autocommit `SNAPSHOT` transaction per operation. Compared against a
+baseline with identical workload shape and key range, but backed by a plain
+`std::unordered_map` behind a single `std::mutex` held for the whole
+operation — the "obvious" alternative to MVCC for making a shared table
+thread-safe, and what makes MVCC's scaling story legible rather than just a
+number in isolation.
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='MVCCFixture' \
+    --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
+```
+
+**Results** (4-core sandbox; `real_time` mode so wall-clock reflects actual
+parallelism, `cv` up to ~20% at 2 threads — the sandbox's scheduler noise,
+consistent with earlier phases' caveats about shared-CPU environments):
+
+| Threads | MVCC ops/sec | Coarse-lock ops/sec |
+|---:|---:|---:|
+| 1 | 375k/s | 23.8M/s |
+| 2 | 572k/s | 3.20M/s |
+| 4 | 554k/s | 1.39M/s |
+
+**Takeaways:**
+- **MVCC throughput holds roughly flat from 1 to 4 threads; the coarse-lock
+  baseline collapses ~17x over the same range** (23.8M/s → 1.39M/s). This is
+  the headline result this benchmark exists to produce: fine-grained,
+  per-key locking (`MVCCStore`'s `VersionChain` mutexes) lets independent
+  transactions on different keys make progress in parallel, while a single
+  global mutex serializes *every* operation regardless of which keys are
+  touched — the more threads contend for it, the worse it gets.
+- **MVCC's absolute per-operation throughput is far lower than the
+  coarse-lock baseline's** (roughly 60x slower single-threaded). This is
+  expected, not a bug: every autocommit op here pays for a full
+  `Begin`/`Commit` pair — a `Transaction` heap allocation, two atomic
+  counter increments, a transaction-shard mutex acquisition on insert and
+  again on erase, plus the version-chain machinery itself — against a
+  workload that's `unordered_map::find`/`operator[]` for the baseline.
+  MVCC's cost buys transactional semantics (snapshots, isolation levels,
+  atomic multi-key commits) the baseline doesn't have; the fair comparison
+  is the *scaling shape*, not the absolute numbers, which is why this
+  benchmark reports both.
+- **Getting the "holds flat" result required fixing a real bottleneck
+  first.** The initial `MVCCStore` implementation used one
+  `std::unordered_map`+`std::mutex` for the whole active-transaction table.
+  Since every autocommit op does exactly one `Begin` (table insert) and one
+  `Commit` (table erase), that single mutex was contended on nearly every
+  operation regardless of which key it touched — the fine-grained
+  `VersionChain` locking never got a chance to matter. Measured with that
+  version, throughput *fell* from 1 to 4 threads (450k/s → 168k/s) instead
+  of holding steady. The fix — sharding the transaction table into 16
+  independently-locked shards by `txn_id % 16` — is what produces the flat
+  line above; see DESIGN.md for the full story. Same pattern as Phase 3's
+  compaction-starvation bug and Phase 4's checkpoint-scan bug: a benchmark
+  built to demonstrate a property instead caught a bug that was hiding it.
+- **Correctness under concurrency is checked separately, not by this
+  benchmark.** `MVCCStoreTest.ConcurrentIncrementNoLostUpdates`
+  (`test/mvcc/mvcc_store_test.cpp`) runs 4 real threads doing 200
+  read-increment-write-commit cycles each against a shared counter, with
+  retry-on-conflict, and asserts the final value is exactly `threads ×
+  increments` — proving first-committer-wins conflict detection actually
+  prevents lost updates rather than just looking plausible under a
+  throughput benchmark that never checks final state.
+
+## Phase 6 — SQL Front-End & Tiny Optimizer
+
+**What's measured:** the same logical query — "find the one row matching a
+given value" (point) and "find the ~100 rows in a given range" (range) —
+issued two ways against an otherwise-identical `BTREE`-backed table of `id
+INTEGER, tag INTEGER, payload TEXT`, where `id` (the primary key) and `tag`
+hold identical values by construction. `WHERE id = X` / `WHERE id >= X AND
+id < X+100` let the planner pick `POINT_LOOKUP`/`RANGE_SCAN`; `WHERE tag =
+X` / `WHERE tag >= X AND tag < X+100` are logically equivalent (same
+result set, same size) but `tag` isn't the primary key, so the planner has
+no index to use and falls back to `FULL_SCAN` — the only difference
+between each pair is which access path the planner chose. Swept across
+1,000 / 10,000 / 100,000 rows to show how the gap grows with table size.
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='PointLookup_.*Predicate|RangeScan_.*Predicate'
+```
+
+**Results** (4-core sandbox, same caveats as earlier phases):
+
+| Rows | Point, indexed (`id`) | Point, unindexed (`tag`) | Slowdown |
+|---:|---:|---:|---:|
+| 1,000 | 1.12 µs | 51.7 µs | 46x |
+| 10,000 | 2.13 µs | 869 µs | 408x |
+| 100,000 | 3.86 µs | 14,444 µs | 3,742x |
+
+| Rows | Range, indexed (`id`) | Range, unindexed (`tag`) | Slowdown |
+|---:|---:|---:|---:|
+| 1,000 | 14.4 µs | 66.8 µs | 4.6x |
+| 10,000 | 19.9 µs | 941 µs | 47x |
+| 100,000 | 29.6 µs | 16,358 µs | 553x |
+
+**Takeaways:**
+- **The indexed access paths grow slowly (roughly logarithmically) with
+  table size; the unindexed ones grow roughly linearly** — exactly the
+  shape the planner's access-path choice predicts. `POINT_LOOKUP` costs one
+  B+-tree descent (`O(log n)`) regardless of which row it's after;
+  `FULL_SCAN` costs a full pass over every row in the table
+  (`O(n)`) even though it's looking for exactly one. At 100,000 rows the
+  gap is already ~3,700x for a point query and ~550x for a bounded range —
+  and both ratios are still growing with `n`, not leveling off.
+- **This is the concrete payoff of Phase 6's planner, not just a
+  restatement of "indexes are faster."** The two queries in each pair are
+  the *same* logical request (same predicate shape, same result set,
+  same table) — the only thing that differs is which column the WHERE
+  clause happens to name. `PlanQuery` (`src/sql/planner.cpp`) is what
+  turns "does this predicate touch the primary key" into "which access
+  path to run," and this benchmark is what confirms that decision matters
+  by orders of magnitude rather than being a marginal optimization.
+- **The range-scan gap is smaller than the point-lookup gap at every row
+  count, which is expected, not a discrepancy.** `RANGE_SCAN` still pays
+  an `O(log n)` B+-tree descent to find its starting key, same as
+  `POINT_LOOKUP` — but then both the indexed and unindexed paths iterate
+  roughly the same ~100-row window, whereas `POINT_LOOKUP` only ever
+  touches one row while `FULL_SCAN` touches every row in the table. The
+  fixed ~100-row scan cost both paths share shrinks the *relative*
+  advantage of indexing without changing its direction.

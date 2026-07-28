@@ -12,6 +12,7 @@
 #include "lsm/memtable.h"
 #include "lsm/sstable.h"
 #include "storage/disk/disk_manager.h"
+#include "wal/log_manager.h"
 
 namespace dbengine {
 
@@ -29,8 +30,13 @@ namespace dbengine {
 // which tier, so a closed engine can be reopened.
 class LSMTreeEngine : public StorageEngine {
  public:
+  // `enable_wal` adds durability for the active memtable: every Put/Delete
+  // is logged (and fsynced) before being applied, so a crash before the
+  // next flush doesn't lose recent writes — the gap Phase 3 documented as
+  // a known limitation. Default off, preserving Phase 3's behavior for
+  // existing callers/tests/benchmarks that don't ask for it.
   explicit LSMTreeEngine(const std::string& db_path, size_t memtable_flush_threshold_bytes = 1 << 20,
-                         int tier_compaction_threshold = 4);
+                         int tier_compaction_threshold = 4, bool enable_wal = false);
   ~LSMTreeEngine() override;
 
   LSMTreeEngine(const LSMTreeEngine&) = delete;
@@ -48,6 +54,8 @@ class LSMTreeEngine : public StorageEngine {
   size_t TotalSSTableBytesOnDisk() const;
   size_t GetDiskReadCount() const;
   size_t GetDiskWriteCount() const;
+  bool IsWALEnabled() const { return wal_enabled_; }
+  size_t GetWALSizeBytes() const;
 
   // Manifest capacity (public so the on-disk ManifestPage struct, defined
   // in the .cpp, can size its arrays against them).
@@ -65,8 +73,14 @@ class LSMTreeEngine : public StorageEngine {
 
  private:
   std::string SSTablePath(int64_t id) const;
+  std::string MemWALPath(int64_t generation) const;
   void LoadManifestOrInitialize();
   void PersistManifestLocked();
+  // Finds any memtable-WAL generation files left over from a crash (there
+  // should be at most a couple — see DESIGN.md), replays them into
+  // active_memtable_ in order, re-logs that replayed data into a fresh
+  // generation, and removes the old files. No-op if !wal_enabled_.
+  void RecoverMemWALOnStartup();
   void FlushActiveMemtable();
   void CompactionLoop();
   // Performs at most one compaction pass (whichever tier needs it most).
@@ -83,6 +97,10 @@ class LSMTreeEngine : public StorageEngine {
 
   std::unique_ptr<DiskManager> manifest_disk_manager_;
   std::atomic<int64_t> next_sstable_id_{0};
+
+  bool wal_enabled_;
+  std::atomic<int64_t> next_wal_generation_{0};
+  std::unique_ptr<LogManager> memtable_wal_;  // null if !wal_enabled_.
 
   mutable std::mutex mutex_;
   std::shared_ptr<MemTable> active_memtable_;

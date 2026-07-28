@@ -11,7 +11,7 @@ int main(int argc, char** argv) {
 
   try {
     dbengine::DiskManager disk_manager(db_file);
-    dbengine::Shell shell(disk_manager);
+    dbengine::Shell shell(disk_manager, db_file);
     shell.Run();
   } catch (const std::exception& e) {
     std::cerr << "fatal: " << e.what() << "\n";

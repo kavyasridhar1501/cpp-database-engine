@@ -11,6 +11,9 @@
 #include <string>
 #include <thread>
 
+#include "wal/log_manager.h"
+#include "wal/log_record.h"
+
 namespace dbengine {
 namespace {
 
@@ -25,11 +28,12 @@ class LSMTreeEngineTest : public ::testing::Test {
 
   void TearDown() override { CleanupFiles(); }
 
-  // Removes the manifest file and every "<file>.sstN" it may have created.
+  // Removes the manifest file and every "<file>.sstN" / "<file>.memwalN" it
+  // may have created.
   void CleanupFiles() {
     std::filesystem::remove(file_path_);
     std::filesystem::path dir = std::filesystem::path(file_path_).parent_path();
-    std::string prefix = std::filesystem::path(file_path_).filename().string() + ".sst";
+    std::string prefix = std::filesystem::path(file_path_).filename().string();
     if (!std::filesystem::exists(dir)) return;
     for (const auto& entry : std::filesystem::directory_iterator(dir)) {
       if (entry.path().filename().string().rfind(prefix, 0) == 0) {
@@ -250,6 +254,96 @@ TEST_F(LSMTreeEngineTest, RandomizedOperationsMatchStdMapOracle) {
   }
   EXPECT_EQ(scanned, oracle.size());
   EXPECT_EQ(oracle_it, oracle.end());
+}
+
+// --- Memtable WAL (durability for the active memtable) ---
+//
+// The engine's destructor always does a graceful final flush of a
+// non-empty memtable (established Phase 3 behavior, kept for parity with
+// BPlusTreeEngine's "close it, reopen it, data's there" experience), which
+// means an in-process test can't simulate "crashed before flush" by simply
+// letting an engine go out of scope — that always takes the graceful path
+// regardless of whether WAL is enabled. Real crash durability for this
+// engine is validated by the crash-injection harness (kill -9, hundreds of
+// runs); these tests instead check the replay mechanism directly and
+// deterministically, by hand-crafting exactly what a crash would leave
+// behind.
+
+TEST_F(LSMTreeEngineTest, WalDisabledByDefaultPreservesPhase3Behavior) {
+  LSMTreeEngine engine(file_path_, 1024, 3);
+  EXPECT_FALSE(engine.IsWALEnabled());
+  EXPECT_EQ(engine.GetWALSizeBytes(), 0u);
+}
+
+TEST_F(LSMTreeEngineTest, WalEnabledLogsWritesAndRotatesGenerationOnFlush) {
+  LSMTreeEngine engine(file_path_, /*memtable_flush_threshold_bytes=*/256,
+                       /*tier_compaction_threshold=*/3, /*enable_wal=*/true);
+  EXPECT_TRUE(engine.IsWALEnabled());
+
+  engine.Put(1, "a");
+  EXPECT_GT(engine.GetWALSizeBytes(), 0u);
+
+  for (KeyType k = 2; k < 50; ++k) {
+    engine.Put(k, "value-" + std::to_string(k));
+  }
+  ASSERT_TRUE(WaitUntil([&] { return engine.NumSSTables() > 0; }));
+
+  // Only the current generation's WAL file should remain — the retired
+  // generation's file must have been cleaned up once its data was safely
+  // flushed to an SSTable.
+  std::filesystem::path dir = std::filesystem::path(file_path_).parent_path();
+  std::string prefix = std::filesystem::path(file_path_).filename().string() + ".memwal";
+  int count = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+    if (entry.path().filename().string().rfind(prefix, 0) == 0) ++count;
+  }
+  EXPECT_EQ(count, 1);
+}
+
+TEST_F(LSMTreeEngineTest, ReplaysLeftoverMemWALGenerationOnStartup) {
+  // Hand-craft a leftover WAL generation file, exactly as if a crash had
+  // happened right after these writes were logged but before the next
+  // flush.
+  std::string wal_path = file_path_ + ".memwal0";
+  {
+    LogManager wal(wal_path);
+
+    LogRecord put_rec;
+    put_rec.type = LogRecordType::UPDATE;
+    put_rec.op = LogOpType::PUT;
+    put_rec.key = 1;
+    put_rec.SetNewValue("recovered-value");
+    wal.Append(put_rec);
+
+    LogRecord put_rec2;
+    put_rec2.type = LogRecordType::UPDATE;
+    put_rec2.op = LogOpType::PUT;
+    put_rec2.key = 2;
+    put_rec2.SetNewValue("to-be-deleted");
+    wal.Append(put_rec2);
+
+    LogRecord del_rec;
+    del_rec.type = LogRecordType::UPDATE;
+    del_rec.op = LogOpType::DELETE;
+    del_rec.key = 2;
+    wal.Append(del_rec);
+
+    wal.Flush();
+  }
+
+  LSMTreeEngine engine(file_path_, 1 << 20, 4, /*enable_wal=*/true);
+  std::string value;
+  ASSERT_TRUE(engine.Get(1, &value));
+  EXPECT_EQ(value, "recovered-value");
+  EXPECT_FALSE(engine.Get(2, &value));  // put, then deleted, before the "crash".
+
+  // The old generation file must be gone — its data now lives in a fresh
+  // generation, re-logged during replay.
+  EXPECT_FALSE(std::filesystem::exists(wal_path));
+
+  engine.Put(3, "still-works");
+  ASSERT_TRUE(engine.Get(3, &value));
+  EXPECT_EQ(value, "still-works");
 }
 
 }  // namespace

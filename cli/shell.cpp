@@ -26,8 +26,28 @@ void PrintHelp(std::ostream& out) {
       << "  write <page_id> <text>   write text (padded/truncated to a page) to page_id\n"
       << "  read <page_id>           read page_id and print it as text\n"
       << "  stats                    print page count / read / write counters\n"
+      << "  sql <statement>          run one SQL statement (CREATE TABLE / INSERT / SELECT / DELETE)\n"
       << "  help                     show this message\n"
       << "  exit                     quit the shell\n";
+}
+
+void PrintQueryResult(const QueryResult& result, std::ostream& out) {
+  if (!result.column_names.empty()) {
+    for (size_t i = 0; i < result.column_names.size(); ++i) {
+      out << result.column_names[i] << (i + 1 < result.column_names.size() ? " | " : "\n");
+    }
+    for (const auto& row : result.rows) {
+      for (size_t i = 0; i < row.size(); ++i) {
+        if (std::holds_alternative<int64_t>(row[i])) {
+          out << std::get<int64_t>(row[i]);
+        } else {
+          out << std::get<std::string>(row[i]);
+        }
+        out << (i + 1 < row.size() ? " | " : "\n");
+      }
+    }
+  }
+  out << result.message << "\n";
 }
 
 }  // namespace
@@ -92,8 +112,27 @@ bool Shell::ExecuteLine(const std::string& line, std::ostream& out) {
     return true;
   }
 
+  if (cmd == "sql") {
+    if (tokens.size() < 2) {
+      out << "usage: sql <statement>\n";
+      return true;
+    }
+    std::string statement = line.substr(line.find(tokens[1]));
+    try {
+      PrintQueryResult(GetOrCreateDatabase().Execute(statement), out);
+    } catch (const std::exception& e) {
+      out << "error: " << e.what() << "\n";
+    }
+    return true;
+  }
+
   out << "unknown command '" << cmd << "', type 'help' for a list\n";
   return true;
+}
+
+Database& Shell::GetOrCreateDatabase() {
+  if (!database_) database_ = std::make_unique<Database>(db_path_ + ".sql");
+  return *database_;
 }
 
 void Shell::Run() {
