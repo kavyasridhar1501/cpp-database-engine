@@ -1,1012 +1,554 @@
 # Design Notes
 
-Running log of architectural decisions and trade-offs, phase by phase.
-Citations point to the CMU 15-445 course materials and Hellerstein, Stonebraker
-& Hamilton, *Architecture of a Database System* (2007), which this project
-uses as its architectural reference (code is original, not derived from
-BusTub).
-
-## Phase 0 — Disk Manager
-
-**Fixed page size (4096 bytes).** Matches the common OS page/sector size, so a
-page-granular read or write is (on typical filesystems) a single aligned I/O.
-4096 is a compile-time constant (`dbengine::PAGE_SIZE` in `src/common/config.h`)
-rather than configurable at runtime: every layer above the disk manager
-(buffer pool frames, node layouts in later phases) is sized against it, and
-BusTub/15-445 make the same simplifying choice for the same reason — it lets
-higher layers reason about "one page" as a fixed-size, self-contained unit
-without a runtime parameter threading through every interface.
-
-**pread/pwrite over seek+read/write.** `DiskManager` never calls `lseek`;
-every access is `pread(fd, buf, PAGE_SIZE, page_id * PAGE_SIZE)` /
-`pwrite(...)`. This makes reads and writes to *different* pages safe to issue
-concurrently from multiple threads without external locking, since the offset
-is passed per-call instead of mutated shared file-descriptor state. That
-matters starting in Phase 1, where the buffer pool manager will dispatch
-concurrent page I/O.
-
-**Page-id allocation is a monotonic counter, not a free list.** Phase 0 has no
-delete path, so `AllocatePage()` is `next_page_id_.fetch_add(1)` and pages are
-never reused. A free list (recycling pages freed by B+-tree merges / LSM
-compaction) is deferred to Phase 2+, once there's something that actually
-frees pages. Introducing it now would be speculative.
-
-**Reading an unwritten/past-EOF page zero-fills rather than erroring.** A page
-id can be allocated (reserved) before it's ever written — the buffer pool will
-rely on this when it allocates a page for a brand-new B+-tree node and
-initializes it in memory before the first flush. Treating "never written" as
-zero-filled data (rather than a distinct error state) keeps the interface to
-one call (`ReadPage`) instead of needing an existence check first, and it
-mirrors sparse-file semantics that most filesystems already give you for free
-via `pread` short-reads.
-
-**No implicit fsync on every write.** `WritePage` uses `pwrite`, which lands
-in the OS page cache; durability requires an explicit `Sync()` call. This is
-deliberate: Phase 0 has no WAL yet, so there is no correctness story around
-crash consistency to enforce. Once Phase 4 implements the ARIES *write-ahead
-logging rule* (log record for an update must be durable before the
-corresponding data page is written back — Hellerstein et al. §5, 15-445
-Lecture on Logging & Recovery), `Sync()` ordering between the WAL file and the
-heap file becomes the enforcement point.
-
-**Single heap file, not per-table files.** All pages, regardless of what
-they'll eventually hold, live in one file addressed by page id. This matches
-BusTub/15-445's disk manager (and most real single-file engines, e.g.
-SQLite) and avoids introducing a table/file-mapping concept before there are
-tables (that arrives with the SQL front-end in Phase 6).
-
-**Error handling: exceptions, not error codes.** `IOException` is thrown on
-any short read/write or failed `open`/`fstat`/`fsync`. At this layer, I/O
-failures are unrecoverable precondition violations (bad path, disk full,
-permissions) rather than expected control flow, so an exception that
-propagates to the CLI's top-level catch is simpler than threading
-`std::expected`-style results through every call site this early. This may be
-revisited once transactions need to distinguish "abort this transaction" from
-"the process should crash."
-
-## Phase 1 — Buffer Pool Manager
-
-**LRU-K (k=2) as the production eviction policy, not CLOCK.** The brief
-allowed either. LRU-K was chosen because it directly encodes the property
-that matters most for a database buffer pool: distinguishing "accessed
-once" from "accessed repeatedly." CLOCK approximates LRU cheaply but shares
-LRU's fundamental blind spot — a page touched exactly once looks the same
-to the policy as a page in a small hot working set, as long as both were
-touched recently. LRU-K's *backward k-distance* (how long ago the k-th most
-recent access happened) makes that distinction explicit: a frame with fewer
-than k accesses has "infinite" backward distance and is evicted first,
-regardless of how recent that single access was. See O'Neil, O'Neil &
-Weikum, "The LRU-K Page Replacement Algorithm For Database Disk Buffering"
-(SIGMOD 1993); this is also the policy BusTub's later-semester projects
-converged on for the same reason.
-
-**Plain LRU is implemented too, but only as a benchmark baseline
-(`LRUReplacer`), not something `BufferPoolManager` is meant to run in
-production.** It exists because "beat plain LRU" needs an honest, fully
-correct plain-LRU implementation to beat — not a strawman. It shares the
-`Replacer` interface with `LRUKReplacer` so both can be dropped into the same
-`BufferPoolManager` unmodified, which is what the Phase 1 benchmark exploits
-to run the identical trace through both.
-
-**Replacer/BufferPoolManager split, with a narrow interface between them.**
-`Replacer` knows only about frame ids and an evictable/non-evictable flag; it
-has no idea what a "page" or a "pin count" is. `BufferPoolManager` owns that
-translation (pin count hits zero → `SetEvictable(frame, true)`) and owns all
-actual page/disk state (the page table, the frame array, dirty flags, and
-writing a victim back before reuse). This mirrors the BusTub/15-445 project
-structure and, more importantly, means a CLOCK replacer could be dropped in
-later without touching `BufferPoolManager` at all — useful if a future phase
-wants to compare policies again under concurrent load.
-
-**Single mutex over the whole `BufferPoolManager`, not per-page latches.**
-Every public method takes one `std::mutex`. This is the simplest correct
-thing and is fine for now — Phase 1 has no concurrent workload requirement
-yet. Per-page (or per-bucket) latching would let concurrent `FetchPage`
-calls for *different* pages proceed in parallel, but introducing that now
-would be optimizing for a scenario (high-thread-count concurrent access)
-this project doesn't exercise until MVCC (Phase 5). Revisit then, guided by
-actual contention measurements rather than guesswork.
-
-**No free-page reuse yet, still.** `DeletePage` returns a frame to
-`BufferPoolManager`'s internal free list, but the underlying disk page id
-itself is never returned to `DiskManager` (which still only ever grows via
-`AllocatePage`). This is the same deferral noted in Phase 0 — there's still
-nothing that both frees pages *and* needs the space back (B+-tree
-merges/LSM compaction in Phase 2/3 will be the first such consumer).
-
-**`Evict()` is O(evictable frames), not O(1) or O(log n).** Both
-`LRUKReplacer` and `LRUReplacer` scan their evictable set on every eviction.
-This is visible in the benchmark numbers: `BM_Zipfian_LRUK` slows from ~63ms
-at pool size 8 to ~729ms at pool size 2048, almost all of it the linear
-eviction scan repeated ~200,000 times over a growing evictable set. It's an
-acceptable simplification for now (correctness and a clean interface over
-micro-optimizing a policy that may still change), but if buffer pools grow
-much larger in later phases this is the first thing to revisit — a
-priority-queue-backed LRU-K or an approximate CLOCK sweep would restore
-O(1) amortized eviction.
-
-## Phase 2 — B+-Tree (Engine A)
-
-**`StorageEngine` uses fixed-size `int64_t` keys and byte-string values
-capped at `MAX_VALUE_SIZE` (64 bytes), enforced by both engines.** This is
-the central simplification of Phase 2. A real B+-tree leaf holding
-variable-length values needs a slotted page (slot directory, free-space
-compaction on delete/update) — legitimate, but a second full subsystem on
-top of the tree logic itself. Capping values to a fixed size means every
-leaf entry is `sizeof(key) + sizeof(length) + MAX_VALUE_SIZE`, a plain C
-array works as the node layout, and there's no free-space management to get
-subtly wrong under interleaved insert/delete. The cap is enforced on the
-LSM-tree (Phase 3) too, even though its memtable/SSTable path doesn't
-strictly need one — so the head-to-head comparison stays apples-to-apples
-rather than one engine incidentally supporting bigger values than the
-other. This is the same style of trade-off CMU 15-445 / BusTub's project 2
-makes (fixed-size `GenericKey`/`RID`), generalized slightly from "a
-pointer" to "a small inline payload." The natural pattern for values that
-don't fit — store a fixed-size row id/offset here and put the actual
-payload in a separate heap page — is exactly how a real non-clustered index
-works, and is the option this leaves open for Phase 6 (SQL rows) rather
-than closing off.
-
-**Node classes are overlaid directly on a `Page`'s byte buffer via
-`reinterpret_cast`, not serialized/deserialized on access.** `BPlusTreePage`
-(and its `LeafPage`/`InternalPage` subclasses) have no virtual functions —
-a vtable pointer would corrupt the byte layout the moment the page is
-written to disk and reread. Every accessor reads/writes the raw bytes in
-place. This is the standard technique for page-based storage engines
-(BusTub does the same) and means there's no separate "wire format" to keep
-in sync with an in-memory representation — the in-memory representation
-*is* the wire format.
-
-**Node capacity is computed at compile time from `PAGE_SIZE`, with one
-slot of headroom reserved above the logical `max_size_`.** `LeafPage`/
-`InternalPage` each declare a fixed C array sized to exactly fill one page
-(`kMaxSize`), but `max_size_` (the logical cap `BPlusTree` enforces before
-triggering a split) defaults to `kMaxSize - 1`. That spare slot is what
-lets `Insert` write the node's entries first and check "did this overflow
-max_size_?" *after*, rather than needing a separate pre-flight capacity
-check before every insert. Default fanout this produces: leaves hold ~54
-entries (8-byte key + 2-byte length + 64-byte value, per PAGE_SIZE=4096),
-internal nodes ~254 children (8-byte key + 8-byte page id) — so a tree
-holding 10M keys is only about 3 levels deep.
-
-**Put/Insert is upsert, not insert-or-fail.** A B+-tree used purely as a
-unique index (BusTub's project 2 framing) typically rejects a duplicate
-key. `StorageEngine` is meant to be used as an actual KV store — including,
-eventually, as the thing SQL row updates go through in Phase 6 — so
-`BPlusTree::Insert` overwrites an existing key's value in place and reports
-whether the key was new. Because leaf values are fixed-size slots, an
-update never needs to move surrounding entries.
-
-**One mutex for the whole tree, not latch crabbing.** Real B+-tree
-implementations take latches on individual nodes and release ancestors
-early once a subtree is known to be split/merge-safe ("latch crabbing"),
-so concurrent readers and writers on different subtrees don't block each
-other. Phase 2 instead takes a single `std::mutex` around every
-`Insert`/`Remove`/`GetValue`/`Begin` call — the same simplification made for
-`BufferPoolManager` in Phase 1, for the same reason (this project has no
-concurrent workload requirement yet; that arrives with MVCC in Phase 5, and
-latch crabbing is worth doing once there's a concurrent benchmark to
-validate it against). One direct consequence: a `BPlusTree::Iterator`
-holds a pin on its current leaf but does *not* hold the tree mutex between
-`Next()` calls, so a scan running concurrently with a mutation is out of
-scope for now.
-
-**The metadata page (root page id persistence) lives in `BPlusTreeEngine`,
-not `BPlusTree`.** `BPlusTree` just tracks `root_page_id_` in memory and
-exposes `GetRootPageId()`; it has no idea a database file has a page 0
-reserved for bookkeeping. `BPlusTreeEngine` owns that policy — it reads the
-root id from page 0 on construction and writes it back after any
-`Put`/`Delete` that changed it. This keeps `BPlusTree` a pure data
-structure over a `BufferPoolManager`, testable without any notion of "this
-is page 0 of a database file," which is exactly how the Phase 2 unit tests
-use it directly.
-
-**Benchmark methodology: random-order inserts, and a buffer pool
-deliberately much smaller than the dataset.** Point-lookup/range-scan/
-insert-throughput are measured with keys inserted in *shuffled*, not
-sequential, order — sequential insertion is the easy case for a B+-tree
-(always splitting the rightmost leaf) and would flatter it relative to
-Phase 3's LSM-tree, whose write path doesn't care about key order at all.
-The buffer pool is fixed at 2,000 frames (8MB) for both the 1M-key (~76MB)
-and 10M-key (~760MB) datasets — a deliberately small, fixed fraction of
-each, modeling an index that doesn't fit in RAM rather than one that does.
-See BENCHMARKS.md for what this exposes: point-lookup latency barely moves
-between 1M and 10M keys (as expected — O(log N) descent, and tree height
-barely changes), but insert throughput drops noticeably at 10M, because the
-same fixed-size pool is a much smaller *fraction* of the larger dataset.
-That's a real cost of a fixed buffer pool against a growing B+-tree, and a
-useful baseline for Phase 3, where an LSM-tree's memtable-then-flush write
-path is expected to degrade far less with scale.
-
-## Phase 3 — LSM-Tree (Engine B)
-
-**Skip list and Bloom filter are original implementations, not vendored
-code.** The hard constraints allow a vendored header-only skip list or
-Bloom filter; this project writes its own instead (`src/lsm/skip_list.h`,
-`src/lsm/bloom_filter.h`), consistent with "write our own code" and keeping
-the whole codebase auditable without a third-party dependency to reason
-about. The skip list follows Pugh (1990); the Bloom filter uses double
-hashing (Kirsch & Mitzenmacher, 2006) to derive k hash functions from two
-64-bit mixes instead of k independent hash functions.
-
-**SSTables reuse Phase 2's fixed-size-value discipline, and it shows up
-directly in the benchmark numbers.** An SSTable's data-page entries have
-the same layout as a B+-tree leaf entry (key + length + a `MAX_VALUE_SIZE`
-slot) for the same reason: fixed-size entries mean bulk-loading a sorted
-page is a flat array fill, no slotted-page free-space bookkeeping. The
-cost is real and visible: BENCHMARKS.md's space-amplification numbers are
-inflated for *both* engines by padding every value out to 64 bytes
-regardless of how many bytes it actually uses (our benchmark's values are
-~8 bytes). This is the same trade-off flagged in Phase 2, now paid a
-second time by the LSM-tree — a deliberate, documented consequence of
-keeping the two engines' storage format comparable rather than letting one
-quietly support more efficient variable-length values than the other.
-
-**Per-SSTable Bloom filter and sparse index are loaded fully into memory
-at `Open()`; only data pages go through a (small, per-SSTable) buffer
-pool.** An SSTable's index (one entry per data page) and Bloom filter are
-small and consulted on every lookup, so there's no reason to page them
-through a cache — they're parsed once into `std::vector`/`BloomFilter`
-objects and kept resident for the SSTable's lifetime. Data pages, which
-could be large, go through an actual `BufferPoolManager` so repeated reads
-of hot pages are still cached. Each SSTable gets its **own** small
-dedicated buffer pool (8 frames) rather than sharing one global cache
-across all SSTables, because `BufferPoolManager` is keyed by a single
-`DiskManager`/file (see Phase 1) and extending it to a shared cache across
-multiple files would mean re-keying frames by `(file, page_id)` — a real
-change to a component two phases old, out of scope here. This is a
-genuine simplification relative to production LSM engines (RocksDB's block
-cache is global, not per-SSTable); noted as a deferred improvement.
-
-**Each SSTable is its own file, deleted outright when compacted away —
-unlike every other "no free-page reuse yet" deferral in this project.**
-Phase 0-2 all defer *disk page* reuse because nothing yet both frees pages
-and needs the space back. Compaction is exactly that consumer, and since
-an SSTable already owns a whole file, the natural (and simplest correct)
-way to reclaim its space is to delete the file, not to recycle pages
-within a shared heap file. Lifetime is managed via `shared_ptr<SSTable>`:
-a compaction that supersedes a table calls `MarkObsolete()` and drops the
-engine's reference, but a concurrent reader that grabbed its own
-`shared_ptr` before the swap keeps the file alive (and only deletes it in
-the destructor, and only if it was marked obsolete) until it's done. This
-is what makes background compaction safe to run concurrently with reads
-without them ever seeing a half-deleted table.
-
-**Flush is synchronous; compaction is genuinely asynchronous (a real
-background thread), per the Phase 3 brief.** `Put`/`Delete` write into the
-active memtable and, if it crosses `memtable_flush_threshold_bytes`,
-build a brand-new SSTable *inline* on the caller's thread (holding the
-engine's mutex only briefly — to swap in a fresh empty memtable — not for
-the disk I/O itself, which proceeds against the old, now-unreachable
-memtable without blocking other operations). Compaction is different: a
-single dedicated thread wakes on a condition variable (or a 100ms poll,
-as a fallback) whenever a tier reaches `tier_compaction_threshold`
-SSTables, merges that tier's tables (a k-way merge over their sorted
-entries — see below), and promotes the result to the next tier. The
-tables being merged are immutable, so the merge itself runs *without*
-holding the engine's lock; the lock is only retaken briefly to install the
-result and retire the old tables. This mirrors why LSM-trees are
-compaction-friendly in the first place: nothing being read is ever being
-mutated.
-
-**Tombstones are dropped only when compacting the bottommost populated
-tier.** A delete can't touch older, already-written SSTables in place, so
-it's recorded as a tombstone entry that must keep shadowing any older
-value for that key until nothing older remains that it could still be
-shadowing. Compaction checks "does any tier below this one currently hold
-data?" before deciding a tombstone is safe to drop entirely; if there's
-anything below, the tombstone is written forward into the merged output
-instead. This is the same rule RocksDB uses (a compaction can drop a
-tombstone once it reaches, or is known to be at, the bottom of the LSM).
-
-**The merge iterator is one algorithm serving two callers, deliberately
-kept separate from tombstone policy.** `LSMMergeIterator` k-way-merges any
-set of priority-ordered cursors (a min-heap on (key, source priority)),
-producing one entry per distinct key — *including* tombstones — with the
-highest-priority source winning ties and every shadowed lower-priority
-entry silently discarded. `Scan()` wraps this with a filter that hides
-tombstones from callers (a `StorageIterator` should never surface a
-deleted key); compaction consumes the raw stream and decides per the rule
-above. Priority order is [memtable, tier 0 newest→oldest, tier 1
-newest→oldest, ...] for `Scan()`, and [tier newest→oldest] for a single
-tier's compaction merge — the same precedence `Get()` uses, so a point
-lookup and a range scan can never disagree about which source wins a key.
-
-**A real bug this surfaced: the background compaction thread can be
-starved by a very fast foreground write loop, growing a tier past its
-manifest capacity.** Under a tight, uncontended write loop (no I/O wait
-between calls), a non-fair mutex can consistently let the thread that just
-released a lock win the race to reacquire it over a thread parked on a
-condition variable — a classic convoy/starvation pattern. This showed up
-concretely: `LSMTreeEngineTest.RandomizedOperationsMatchStdMapOracle`
-(20,000 tight-loop ops) crashed roughly 1 run in 20 with "exceeded manifest
-per-tier SSTable capacity" because the compaction thread never got
-scheduled in time. The fix is backpressure, not a bigger capacity number:
-`kWriteStallTierSize` (comfortably below the hard manifest cap) is checked
-after every flush, and if crossed, the *writer* calls
-`CompactOneTierIfNeeded()` itself — the same method the background thread
-calls, guarded by a single `compaction_running_` flag so two callers never
-duplicate the same merge. This mirrors how production LSM engines handle
-the same problem (RocksDB's write stalls): if compaction can't keep up,
-the writer causing the backlog pays for it directly, which bounds tier
-growth regardless of how the OS happens to schedule the background thread.
-This is exactly the kind of bug a fixed-seed unit test won't reliably catch
-and a stress-repeated one will — worth remembering for Phase 5's MVCC work,
-which will have considerably more concurrency surface than this.
-
-**Manifest capacity is a fixed-size array (8 tiers × 16 SSTables/tier),
-not a growable log.** The manifest is one page: `next_sstable_id` plus,
-per tier, a count and an array of SSTable ids. This is enough headroom for
-any workload this project's tests/benchmarks generate (size-tiered
-compaction keeps steady-state occupancy per tier below the trigger
-threshold, itself well below the array capacity — see the backpressure
-mechanism above), but it is a real scale limit, not a real design: a
-production system would use a growable, append-only manifest log (exactly
-what RocksDB's `MANIFEST` file is). Flagged rather than fixed, since nothing
-in this project's scope exercises it.
-
-**No WAL yet for the LSM-tree either — same phased deferral as the
-B+-tree.** A crash mid-way loses whatever's in the active memtable since
-the last flush, which is the well-known reason real LSM engines pair a
-memtable with a parallel WAL. `LSMTreeEngine`'s destructor *does* flush a
-non-empty memtable on a clean shutdown (stopping the compaction thread
-first), so "close the engine, reopen it" behaves the same as the B+-tree
-engine for graceful shutdown — it's specifically crash durability that's
-deferred to Phase 4, uniformly across both engines.
-
-## Phase 4 — Write-Ahead Log & ARIES-Style Recovery
-
-**Logging is logical, not physical.** A production ARIES implementation
-usually logs physical (or physiological) before/after byte images of a
-page. This project logs at the level of the operation instead: an UPDATE
-record says "Put(key, new_value)" or "Delete(key)" happened, carrying
-whatever prior value undo would need to restore. Two things make this the
-right call here rather than a shortcut: every record becomes small and
-fixed-size (capped by `MAX_VALUE_SIZE`, the same constant that already
-bounds a B+-tree leaf entry and an SSTable entry — see Phase 2/3), so the
-WAL can reuse the exact "pack fixed-size records into pages" pattern
-already used everywhere else in this codebase, with no slotted-page
-framing to invent. More importantly, it's what the ARIES paper itself
-prescribes for tree-structured indexes specifically: a physical undo of "restore
-these exact bytes to this exact page" stops making sense once a
-subsequent split or merge has changed that page's layout, so B-tree
-operations need logical undo regardless. The trade-off this buys: replay
-must be deterministic (the same sequence of logical operations from the
-same starting state reconstructs the same tree — true here, since
-split/merge behavior is a pure function of `max_size_` and insertion
-history) and there's no per-page LSN stamping or dirty-page table, which
-is what makes the next few decisions possible.
-
-**No per-page LSNs, no dirty-page table — checkpoints are "sharp"
-instead.** Physical ARIES needs both because REDO must know, per page,
-exactly how far back it needs to start (the page's own LSN) and a
-"fuzzy" checkpoint (cheap, doesn't block writers) still needs the
-dirty-page table's recLSNs to bound REDO's start point correctly. This
-project doesn't track either. Instead, `DoCheckpoint()` calls
-`BufferPoolManager::FlushAllPages()` before recording anything — a
-synchronous, pause-the-world checkpoint that guarantees every committed
-change is durably on disk at that instant, except for transactions still
-active right then (which get recorded, by id and last LSN, in the
-checkpoint itself). That's a real cost (checkpointing gets slower as the
-buffer pool holds more dirty pages) traded for a recovery algorithm that
-doesn't need a second bookkeeping structure threaded through every page
-write. Worth revisiting if a later benchmark shows checkpoint pauses
-actually hurting foreground latency — nothing here does yet.
-
-**A bug the checkpoint pointer fixed: recovery time was bounded by total
-log size, not log-since-checkpoint — silently defeating the point of
-checkpointing.** The first working version of `RecoverOnStartup()` located
-the last checkpoint by scanning the *entire* log forward with
-`LogManager::ReadAll()`, and only then trimmed the actual Analysis/Redo
-work to start from that checkpoint. The trim was correct; the scan to
-find it wasn't bounded, and dominated recovery time for any log large
-enough to matter. The benchmark built specifically to show "checkpoints
-bound recovery time" (see BENCHMARKS.md) instead showed recovery time
-still scaling *linearly with total log size even with frequent
-checkpoints* — the fix was persisting the LSN of the most recent complete
-checkpoint's `CHECKPOINT_BEGIN` record in the engine's own metadata page
-(the same page that already holds the B+-tree's root page id), so
-recovery reads that one field, jumps straight to the checkpoint's small
-bracket via `LogManager::ReadRecord()`, and only then calls
-`ReadFrom(redo_start_lsn)` for the actual working set. This is the same
-category of "measurability caught a real gap" story as Phase 3's write-
-starvation bug: the benchmark wasn't just reporting a number, it falsified
-the design's central claim before the fix, which is exactly what it was
-built to do.
-
-**Undo is per-transaction and independent, not ARIES's globally
-LSN-interleaved order.** Real ARIES processes all losers' pending undo
-actions in strict descending LSN order, globally across transactions, because
-physical undo needs to respect page-latching dependencies between them. This
-project's undo is logical and key-scoped — one transaction's compensations
-never touch another transaction's bookkeeping — so undoing each loser
-transaction fully, one at a time, is still correct without that interleaving.
-Every compensating action writes a CLR (Compensation Log Record) carrying an
-`undo_next_lsn`, so an undo interrupted by a second crash resumes correctly:
-recovery's backward walk treats a CLR it encounters as "already done, skip to
-its `undo_next_lsn`" rather than redoing the compensation. The crash-injection
-harness's random kill points land mid-abort often enough across hundreds of
-runs to exercise this path empirically, not just in the two-crash unit test
-written for it directly.
-
-**The B+-tree gets the full ARIES treatment; the LSM-tree gets a smaller,
-deliberately asymmetric one.** `WALBPlusTreeEngine` adds explicit
-multi-operation transactions (`Begin`/`Put`/`Delete`/`Get`/`Commit`/`Abort`)
-specifically so `Abort` — and therefore recovery's Undo phase — has
-something real to demonstrate. `LSMTreeEngine`'s optional WAL (default
-off, preserving Phase 3's behavior for existing callers) is redo-only: log
-a Put/Delete before applying it to the memtable, replay on restart. There's
-no transaction concept, no undo, because there's nothing to undo — an
-SSTable is built atomically or not at all, and the memtable itself is pure
-in-memory state that a crash simply erases regardless of what a WAL says
-about it. The asymmetry mirrors what these two structures actually need
-protection from: the B+-tree mutates a shared on-disk structure in place
-(splits, merges, page overwrites) where "committed" vs. "not" is a real
-distinction worth transactions for; the LSM-tree's on-disk artifacts
-(SSTables) are already immutable and atomic by construction, and the only
-gap Phase 3 left was "durability for whatever's still sitting in the
-memtable" — which a plain append-and-replay log closes completely on its
-own.
-
-**A second correctness bug the memtable WAL's design specifically avoids:
-truncating a single shared log file races against concurrent writers.**
-The first design considered was one WAL file for the active memtable,
-truncated and restarted every time a flush completed. That has a real data-
-loss window: between swapping in a fresh empty memtable and that flush's
-SSTable build finishing, a *different* write landing in the new memtable
-would log to the *same* file, and then get silently discarded when the
-flush's truncation ran. The fix (implemented, not just noted) is a
-per-generation WAL file — `db_path + ".memwal" + generation` — rotated
-atomically with the memtable swap, so a flush only ever deletes the file
-for the generation it just durably flushed, never the one concurrent
-writes are now using. Recovery replays every generation file it finds
-(there's normally at most one; a crash mid-flush can leave two) in
-ascending order into a fresh memtable, immediately re-logging that
-replayed data into a new generation so it stays protected until the next
-flush.
-
-**The crash-injection harness uses a real `fork`/`SIGKILL`, not an
-in-process simulation, and that distinction mattered while building the
-test oracle.** A C++ object going out of scope inside the same process
-always runs its destructor — for `LSMTreeEngine` that means a graceful
-final flush regardless of whether WAL is enabled, which would make an
-in-process "simulated crash" incapable of ever proving the WAL did
-anything (the graceful path saves the data either way). The harness
-instead forks a real worker process, lets it run unpaced for a random
-1-50ms, and sends `SIGKILL` — nothing runs on the way out. Building the
-oracle for this surfaced its own subtlety: a worker that logs "commit
-confirmed" to a side file *after* the engine call returns has a race (the
-process can be killed between the engine call succeeding and that log
-line reaching disk), which showed up immediately as spurious failures —
-"key present in the DB but not confirmed in the side log" — that looked
-like an engine bug but was the test oracle's own gap. The fix is
-bracketing every attempt with an 'A' (before) and 'C' (after) line, both
-individually fsynced: at most one *trailing* bracket in the file can be
-left dangling (an 'A' with no matching 'C'), and only that one key's
-outcome is genuinely ambiguous — every other key's last 'C' value must
-match the DB exactly. See `test/crash/crash_recovery_test.cpp`.
-
-## Phase 5 — MVCC Concurrency
-
-**`MVCCStore` is deliberately not a `StorageEngine`.** The
-`Get`/`Put`/`Delete`/`Scan` interface both disk engines implement has no
-concept of a transaction boundary or an isolation level, and demonstrating
-those is the entire point of this phase. Retrofitting `StorageEngine` to
-carry an implicit txn per call (as `WALBPlusTreeEngine` does for atomicity)
-would either flatten every read to its own snapshot — making the anomalies
-this phase is supposed to demonstrate impossible to show — or silently
-change the interface's contract for the two engines already built against
-it. `MVCCStore` instead sits beside the disk engines as a third, self-
-contained component with a richer API
-(`Begin`/`Read`/`Write`/`Delete`/`Commit`/`Abort`) modeled on
-`WALBPlusTreeEngine`'s explicit-transaction shape, but in-memory only — the
-concurrency-control problem is orthogonal to the durability problem Phase 4
-already solved, and combining them (an MVCC engine that's also disk-backed
-and WAL-logged) would be a substantial project in its own right rather than
-a natural extension of either.
-
-**Snapshot isolation does not prevent write skew — and this project shows
-that honestly rather than papering over it.** The original brief asks for a
-demonstration where "dirty read, non-repeatable read, and write skew appear
-under weak isolation and vanish under MVCC." Taken literally that's not
-achievable: it's a well-established result (Berenson et al., *A Critique of
-ANSI SQL Isolation Levels*, 1995; Fekete et al., *Making Snapshot Isolation
-Serializable*, 2005) that plain snapshot isolation (SI) — what most people
-mean by "MVCC" — closes dirty reads and non-repeatable reads but not write
-skew, because SI only checks for write-write conflicts, and write skew is a
-read-write (rw) anti-dependency between two transactions that never write
-the same key. Rather than either contradicting that theory to match the
-brief's wording, or silently building full Cahill-et-al. Serializable
-Snapshot Isolation (a materially larger undertaking — real SSI tracks
-rw-antidependency edges between *all* concurrently active transactions and
-detects dangerous structures in that graph, not just conflicts against the
-committing transaction), this phase implements four isolation levels and is
-explicit about which anomaly each one closes:
-
-| Isolation level | Dirty read | Non-repeatable read | Write skew |
-|---|---|---|---|
-| `READ_UNCOMMITTED` | visible | visible | visible |
-| `READ_COMMITTED` | prevented | visible | visible |
-| `SNAPSHOT` | prevented | prevented | **visible** (textbook SI behavior) |
-| `SERIALIZABLE_SNAPSHOT` | prevented | prevented | prevented |
-
-`SERIALIZABLE_SNAPSHOT` is a simplified, conservative SSI-*lite*: at commit
-time it checks the transaction's read set (not just its write set) for
-values written and committed by someone else after the transaction's
-snapshot began, which catches the classic two-key write-skew pattern (each
-side reads both keys, writes a different one) without implementing the full
-rw-antidependency graph. It will reject some transactions a full SSI
-implementation would allow (it doesn't distinguish "dangerous structure"
-from "any rw-conflict on a read key"), trading precision for
-implementability — a documented, deliberate simplification in the same
-spirit as Phase 4's sharp checkpoints. See
-`test/mvcc/mvcc_store_test.cpp`'s `WriteSkew*` tests for the exact
-interleaving that makes this concrete: the same two-transaction schedule
-commits both sides under `SNAPSHOT` (violating the "at least one doctor on
-call" invariant) and aborts the second committer under
-`SERIALIZABLE_SNAPSHOT`.
-
-**Version chains, not a single mutable slot.** Each key maps to a
-`VersionChain` — a `std::list<Version>` behind its own `std::mutex`, `list`
-specifically chosen so a transaction's `WriteRecord` can hold a *stable
-iterator* into the chain, giving O(1) commit (flip `committed`/`commit_ts`
-through the stored iterator) and O(1) abort (erase through the stored
-iterator) instead of a linear re-search. Each `Version` carries both a
-`seq` (assigned at write time, a total order over writes regardless of
-commit status — all `READ_UNCOMMITTED` needs) and a `commit_ts` (assigned
-only at commit time — what `READ_COMMITTED`/`SNAPSHOT`/
-`SERIALIZABLE_SNAPSHOT` order by). Read-your-own-writes is unconditional:
-`Read()` always checks for the calling transaction's own pending version
-first, before consulting isolation-level visibility rules, because a
-transaction should always see its own uncommitted writes regardless of what
-isolation level it's running under.
-
-**Commit-time conflict detection uses first-committer-wins, with chains
-locked in a fixed global order to avoid deadlock.** `Commit()` collects
-every key it needs to conflict-check (the write set always, plus the read
-set under `SERIALIZABLE_SNAPSHOT`), sorts and dedups them, then locks each
-key's `VersionChain` mutex *in that sorted order* before checking anything.
-Two transactions committing concurrently over overlapping key sets will
-therefore always try to acquire those mutexes in the same relative order,
-which rules out the classic "A locks X then waits for Y; B locks Y then
-waits for X" deadlock without needing a deadlock detector or a lock-wait
-timeout. A transaction aborts (and its writes are discarded) if any locked
-key already has a version committed by someone else *after* this
-transaction's snapshot began (`commit_ts > start_ts`) — first-committer-
-wins, not first-writer-wins, since a losing writer with no conflicting
-*committed* version by commit time should still be allowed to proceed.
-
-**Garbage collection tracks every active transaction's `start_ts`, not just
-the oldest one.** The first version of `RunGarbageCollection()` computed a
-single `min_active_start_ts` and reclaimed any committed version once the
-next-newer version's `commit_ts` fell at or before that minimum. That's
-*safe* (it never reclaims a version some active snapshot still needs) but
-needlessly conservative: with two active readers holding different
-snapshots, a version needed only by the *newer* reader would be kept
-correctly, but so would every version between the oldest reader's boundary
-and the newest committed version, even ones neither reader can see. The
-final version instead computes the full set of active `start_ts` values and
-reclaims a committed version `v` exactly when no active transaction's
-`start_ts` falls in `[v.commit_ts, next_newer.commit_ts)` — the half-open
-interval during which `v` is precisely what that snapshot would resolve to.
-`test/mvcc/mvcc_store_test.cpp`'s `GarbageCollectionRespectsActiveSnapshot`
-exercises this directly: a long-running reader holding an old snapshot
-keeps exactly the one version it needs (plus the current version), while
-versions in between — committed after the reader's snapshot but superseded
-before the current one — get reclaimed.
-
-**The throughput-scaling benchmark caught a real bottleneck before this
-section was even written: a single global mutex guarding the entire
-transaction table.** The initial implementation stored all active
-transactions in one `std::unordered_map<int64_t, std::unique_ptr<Transaction>>`
-behind one `std::mutex`. Per-key `VersionChain` locking was already
-fine-grained, but every `Begin` (insert), every `Read`/`Write`/`Delete`
-(lookup), and every `Commit`/`Abort` (erase) still had to take that one
-mutex — meaning autocommit-style short transactions (the common case the
-benchmark exercises: one `Begin`/op/`Commit` per operation) serialized on
-it almost entirely regardless of which keys they touched. The
-throughput-scaling benchmark (`benchmark/mvcc_bench.cpp`) exposed this
-directly: measured throughput *fell* from 1 to 4 threads (450k/s → 168k/s)
-instead of holding steady, the opposite of what fine-grained per-key
-locking should produce. The fix is sharding the transaction table into 16
-independently-locked shards keyed by `txn_id % 16` (`MVCCStore::TxnShard`,
-same technique the buffer pool and LSM-tree already use elsewhere in this
-project for exactly this reason), so concurrent transactions on different
-threads mostly land in different shards. After the fix, throughput holds
-essentially flat from 1 to 4 threads instead of collapsing — see
-BENCHMARKS.md for the numbers. This is the same "the benchmark wasn't just
-reporting a number, it falsified a design assumption" pattern as Phase 3's
-compaction-starvation bug and Phase 4's checkpoint-scan bug.
-
-**Concurrency-safety contract: one thread drives a given `txn_id` at a
-time.** `Begin`/`Read`/`Write`/`Delete`/`Commit`/`Abort` are never called
-concurrently for the *same* `txn_id` from two threads — a standard
-one-thread-per-session model, the same assumption `WALBPlusTreeEngine`'s
-transaction API makes. This is what allows `Transaction`'s own fields
-(`read_set`, `write_set`, `write_records`) to be touched without a
-per-transaction lock once safely looked up from its shard under
-`TxnShard::mutex`: no other thread can be concurrently mutating or erasing
-that same transaction.
-
-## Phase 6 — SQL Front-End & Tiny Optimizer
-
-**Every table shares one `StorageEngine` instance instead of getting its
-own file.** A real engine gives each table (and each index) its own
-B-tree/LSM-tree; that's substantial file/lifecycle management that has
-nothing to do with parsing or planning, which is this phase's actual
-subject. Instead, `Database` opens a single `StorageEngine` and every
-table's rows are namespaced inside its one `int64_t` keyspace: the top
-`kTableIdBits` (16) bits of the key hold a table id, the remaining 48 bits
-hold the row's primary key (`catalog.h`'s `EncodeKey`/`DecodeTableId`/
-`DecodeRowKey`). Ascending key order therefore groups each table's rows
-into one contiguous range, in table-id order — which is exactly what
-`Executor`'s range/full scans rely on: start a `Scan()` at the table's
-first key and stop the moment a decoded key's table id no longer matches,
-rather than needing any engine-level notion of "table boundary." The
-trade-off is real (at most `2^16` tables, `2^48` rows each — both
-generous here, but a real limit a production system wouldn't accept) and
-deliberate: it turns "give every table real isolation" into a non-problem
-for this phase, in the same spirit as Phase 4's sharp checkpoints trading
-checkpoint cost for a simpler recovery algorithm.
-
-**The primary key is the only column the planner can ever use as an
-index, because it's the only column backed by one — `KeyType` is a single
-`int64_t` across this entire project (`config.h`), so `CREATE TABLE`
-requires the first column to be `INTEGER` and treats it as the row's
-`StorageEngine` key.** This is the load-bearing simplification the whole
-"tiny optimizer" rests on: with exactly one indexed column, access-path
-selection collapses to three cases — an equality on the primary key
-(`POINT_LOOKUP`), a bound on the primary key (`RANGE_SCAN`), or neither
-(`FULL_SCAN`) — instead of the secondary-index and join-order search space
-a real optimizer's cost model has to explore. `PlanQuery` (`planner.cpp`)
-implements exactly those three cases: an `EQ` on the primary key wins
-outright (cheapest possible access path); otherwise every `LT`/`LE`/`GT`/
-`GE` bound on the primary key is intersected into one `[lo, hi]` range;
-otherwise it's a full scan. Every comparison not already implied by the
-chosen path — always *every* comparison, for `FULL_SCAN` — travels along
-as a residual filter the executor applies after fetching, so a plan is
-always correct even when it's not maximally selective (e.g. two
-contradictory bounds on the primary key still fetch the intersecting
-range and then filter it down to nothing).
-
-**No secondary indexes, so "planning" never has to consider more than one
-access path per table — that's the specific scope cut that keeps this a
-"tiny" optimizer rather than a real one**, and it's worth being explicit
-about what a real cost-based optimizer does that this one doesn't: choose
-among *multiple* candidate indexes by estimated selectivity, decide join
-order and join algorithm across multiple tables, and use cardinality
-estimates (histograms, sampling) rather than "primary key predicate present
-or not." None of that machinery has anywhere to attach without secondary
-indexes or multi-table queries, both explicitly out of scope here (see
-Deferred, below) — adding either is what would make "optimizer" stop
-needing the qualifier "tiny."
-
-**The grammar is a deliberately small subset: `CREATE TABLE` / `INSERT` /
-`SELECT` / `DELETE`, `WHERE` limited to an `AND`-conjunction of single
-column-vs-literal comparisons, no `UPDATE`, no `OR`, no joins, no
-subqueries, no aggregates.** `UPDATE` is absent by design, not oversight:
-every `StorageEngine::Put` (and therefore `EncodeKey`) is already an
-upsert, so re-`INSERT`ing an existing primary key overwrites the row —
-`DatabaseTest.UpdateSemanticsViaReinsert` locks that behavior in as a
-test rather than leaving it as an undocumented accident. `WHERE`'s
-restriction to an `AND`-only conjunction (no `OR`, no parenthesized
-sub-expressions) is what keeps `PlanQuery`'s bound-intersection logic a
-simple min/max fold instead of needing to reason about a full boolean
-expression tree — an `OR` between two primary-key bounds would need a
-*union* of ranges (or two separate scans), which is a reasonable next step
-but adds real complexity for a phase whose point is the planner's
-access-path decision, not its expression evaluator.
-
-**Row encoding is a fixed, non-nullable layout chosen to fit inside
-`MAX_VALUE_SIZE` (64 bytes) — the same cap both storage engines already
-enforce, now inherited by the SQL layer rather than worked around.** The
-primary key is never part of the encoded payload (it's already the
-`StorageEngine` key), which buys back 8 bytes of that budget for free.
-Remaining columns are encoded in schema order: `INTEGER` as 8 raw bytes,
-`TEXT` as a 2-byte length prefix plus its bytes (`EncodeRow`/`DecodeRow` in
-`catalog.cpp`). `Database::ExecuteInsert` raises a `SqlException` — not a
-generic `IOException` from deep inside the storage layer — the moment a
-row would exceed the cap, so the error is legible at the SQL layer where
-the user's statement is visible, not several layers down inside a `Put()`
-call whose caller no longer has the original values in scope.
-
-**The catalog is in-memory only and does not persist across a `Database`
-being destroyed and reconstructed on the same file.** This is a real,
-intentional scope cut for this phase, not an oversight: the alternative
-(persisting table schemas as their own small metadata structure,
-presumably page 0 of the shared engine, mirroring how `BPlusTreeEngine`
-already persists its root page id there) is a well-understood, mechanical
-addition that adds file-format work orthogonal to parsing/planning/
-execution — this phase's actual subject — and is listed under Deferred
-below rather than built speculatively. Concretely: the row data itself
-*is* durable (the underlying `StorageEngine` is disk-backed, same as
-every other phase), but interpreting it correctly again requires
-re-issuing the same `CREATE TABLE` statements in the same order within a
-new `Database` instance, so table ids line up with what's already on disk.
-Every test and the CLI's `sql` command only ever use a `Database` within
-one process lifetime, so this doesn't block correctness demonstration —
-it's a forward-looking gap, not a silent one.
-
-**The CLI's `sql` command uses a separate file (`db_path + ".sql"`), never
-the same file the raw `alloc`/`write`/`read` commands touch.** Those
-commands write directly through `DiskManager` with no notion of the SQL
-layer's table-id key-prefixing scheme; sharing a file would let the two
-corrupt each other's data silently (a raw `write` landing on a page the
-SQL layer's B+-tree considers its own, or vice versa). Keeping them on
-separate files is the same reasoning that keeps a WAL in its own
-`.wal`-suffixed file rather than interleaving log records into the data
-file's own page space.
-
-## Phase 7 — Validation: Differential Testing & TPC-Style Workloads
-
-**Linking a real SQLite for differential testing doesn't violate this
-project's "no external database libraries" rule, because that rule is
-about what ships in the engine, not what validates it.** The constraint
-(stated from the very first message of this project) exists so the B+-tree,
-LSM-tree, WAL/recovery, MVCC, and SQL layers are all this project's own
-work, not a wrapper around someone else's database. A test-only dependency
-that never links into `dbengine_core` or `dbengine_cli` — SQLite is pulled
-in via `find_package(SQLite3)` only inside `if(DBENGINE_BUILD_TESTS)`, and
-only `dbengine_tests` links `SQLite::SQLite3` (`test/CMakeLists.txt`) —
-plays the same role GoogleTest and Google Benchmark already do: a
-system/FetchContent tool that *checks* the engine, not a component *of* it.
-The Docker image (which builds with `-DDBENGINE_BUILD_TESTS=OFF`) has zero
-SQLite dependency, verified directly: `ldd` on the resulting `dbengine_cli`
-shows no `libsqlite3` linkage.
-
-**Differential testing needs no translation layer for the SQL *text*
-itself — this project's grammar (Phase 6) is a strict syntactic subset of
-real SQL — but does need one narrow semantic bridge: primary-key
-uniqueness.** `CREATE TABLE`/`INSERT`/`SELECT`/`DELETE` statements in this
-project's dialect parse identically in SQLite, so the exact same statement
-string can run against both and the results compared with no rewriting —
-*except* that this project's grammar treats column[0] as an implicit,
-always-enforced primary key (every `StorageEngine::Put` is an upsert),
-while bare `id INTEGER` in standard SQL is just a plain column with no
-uniqueness at all. The first version of this test suite sent identical
-text to both sides and found what looked like a serious bug: after a
-randomized insert/delete sequence, SQLite reported *far* more rows than
-this project's engine for the same key, e.g. three separate rows all with
-`id = 114` where the engine correctly held exactly one. That's not a bug —
-it's SQLite faithfully doing what was asked (insert three rows; nothing
-said `id` had to be unique), which is precisely why differential testing
-against a real, independently-implemented SQL engine is valuable: it
-surfaces exactly this kind of assumption a test author could otherwise
-bake into both sides of a comparison without noticing. The fix
-(`test/validation/sqlite_differential_test.cpp`) rewrites only the two
-statement kinds where it matters before sending them to SQLite —
-`CREATE TABLE`'s first `INTEGER` becomes `INTEGER PRIMARY KEY`, and
-`INSERT` becomes `INSERT OR REPLACE` — so SQLite enforces the same
-one-row-per-key invariant this project's storage layer always has. Every
-other statement (`SELECT`, `DELETE`, and the untouched remainder of
-`CREATE TABLE`/`INSERT`) is sent completely unmodified.
-
-**The randomized differential test deliberately avoids two of this
-project's own documented scope limits rather than treating them as bugs
-when SQLite "disagrees."** Generated primary keys stay non-negative
-(this project rejects negative keys — see Phase 6's key-encoding scheme;
-SQLite has no such restriction) and generated `TEXT` payloads stay well
-under `MAX_VALUE_SIZE`. Both are already covered directly by
-`DatabaseTest.ThrowsOnNegativePrimaryKey` and
-`ThrowsOnRowTooLargeForMaxValueSize` (Phase 6) — the differential suite's
-job is comparing *behavior within the SQL subset both sides actually
-support*, not re-litigating scope decisions Phase 6 already made and
-documented.
-
-**"TPC-C-style" and "TPC-H-style" here mean *inspired by*, not
-*compliant with*, the official specifications — worth being explicit about
-given how easy it is for a benchmark name to imply more rigor than it
-delivers.** The real TPC-C benchmark specifies five transaction types
-(New-Order, Payment, Order-Status, Delivery, Stock-Level) with a fixed
-mix, strict response-time percentiles, ACID compliance requirements, and
-audited data-scaling rules; TPC-H specifies 22 read-only analytical
-queries, most involving multi-table joins, `GROUP BY`, and aggregates,
-over a specific scale-factor schema. This project's SQL layer supports
-none of `UPDATE`, joins, `GROUP BY`, or aggregates (Phase 6's deliberate
-scope cuts), so literal compliance with either spec is not achievable
-without building substantially more of a SQL engine — out of scope for a
-validation phase. What's implemented instead:
-
-- **TPC-C-*inspired*** (`benchmark/tpcc_bench.cpp`): a `warehouse`/
-  `customer`/`stock`/`orders`/`order_line` schema with TPC-C's composite
-  `(warehouse_id, local_id)` keys flattened into single `INTEGER` primary
-  keys by arithmetic (`w_id * customers_per_warehouse + local_id`, the
-  standard workaround on any engine without composite-key support — see
-  Phase 6's key-encoding section for why this project's keys are single
-  columns to begin with), and a simplified New-Order transaction: look up
-  the placing customer, then for each of 10 order lines look up and
-  decrement the relevant stock row (an upsert-as-update, this project's
-  storage model) and insert an order-line row, finishing with one orders
-  row insert. Not wrapped in an actual multi-statement transaction — the
-  SQL layer doesn't expose `Begin`/`Commit` yet (see Deferred, below) —
-  so what this measures is the SQL layer's raw statement throughput under
-  a TPC-C-*shaped* multi-table access pattern, not transactional cost.
-- **TPC-H-*inspired*** (`benchmark/tpch_bench.cpp`): a single large
-  `lineitem`-like fact table (300,000 rows) and a Q1-style filter
-  (`WHERE l_shipdate <= X`) swept across selectivity levels. `l_shipdate`
-  is deliberately scattered relative to the primary key via a multiplier
-  coprime with its value range, so no insertion-order trick lets the
-  planner do better than a genuine `FULL_SCAN` — the honest worst case
-  this benchmark characterizes, and arguably TPC-H's actual defining
-  access pattern (a large, non-indexed analytical filter) even without the
-  join and `GROUP BY` that would follow it in the real query.
-
-## Phase 8 — Deployment
-
-**Three deliverables, each a thin layer over work already done, deliberately —
-this phase isn't supposed to add new storage-engine ideas, only make
-what exists reachable.** A GHCR image (`.github/workflows/publish.yml`)
-builds the same `Dockerfile` the CI workflow already validates on every
-push and publishes it to `ghcr.io/<owner>/<repo>` using the repository's
-automatic `GITHUB_TOKEN` — no new build logic, no separate registry
-credentials to manage. A static results page (`docs/index.html`, deployed
-via `.github/workflows/pages.yml`) is hand-written HTML/CSS transcribing
-BENCHMARKS.md's headline numbers — no generator, no client-side JS, no
-external CDN, consistent with this project's "no external dependencies"
-ethos extended into its own docs site. And a read-only HTTP API
-(`src/http/`) is a thin network front-end over `Database::Execute`,
-restricted to `SELECT` by construction (see below), reusing the parser,
-planner, and executor from Phase 6 completely unchanged.
-
-**The read-only HTTP API is built on raw POSIX sockets, not an external
-web framework, for the same reason the SQL layer has its own lexer
-instead of a parser-generator library: this project's constraint is "no
-external libraries in the engine," and a demo-scale HTTP server (two
-routes, GET-only, no keep-alive) is well within what's reasonable to
-build directly.** `HttpServer` parses just enough of an HTTP/1.1 request
-(the request line and enough of the headers to find the blank-line
-terminator) to route `GET /health` and `GET /query?sql=...`, and responds
-with a small hand-written JSON serializer for `QueryResult` — no
-`nlohmann/json`, no `cpp-httplib`. This mirrors the same trade-off made
-for SQLite in Phase 7 in the opposite direction: SQLite was worth linking
-because differential testing specifically needs an independent, mature
-implementation to compare against; a JSON serializer or HTTP parser needs
-no such independence, so writing the (much smaller) minimal version that
-covers this project's exact two routes is the more consistent choice.
-
-**Read-only is enforced by parsing every request twice: once by
-`HttpServer` to check the statement's type, and again by
-`Database::Execute` to actually run it.** `HandleConnection` calls
-`Parser::Parse(sql)` itself and rejects anything that isn't a
-`SelectStmt` with a 400 *before* ever calling `db_->Execute()` — so a
-`DELETE`/`INSERT`/`CREATE TABLE` sent to `/query` never reaches the
-engine at all, not even to fail partway through. The obvious optimization
-(parse once, pass the already-built `Statement` to a lower-level execute
-call) isn't available without changing `Database`'s public API, and a
-double parse costs microseconds against network I/O that costs
-milliseconds — not worth it here.
-
-**Single-threaded, one connection at a time, by design — not a
-"come back to this" gap.** `Run()`'s accept loop fully handles one
-connection (read request, execute, write response, close) before polling
-for the next. `Database` was never designed for concurrent access from
-multiple threads (no locking anywhere in `Catalog`, `EncodeRow`/`DecodeRow`,
-or the executor), and none of the underlying `StorageEngine`s expose a
-concurrency contract for arbitrary multi-threaded `Get`/`Scan` either
-(`MVCCStore`, Phase 5's answer to exactly this problem, is a separate,
-in-memory-only component that the SQL layer doesn't sit on top of — see
-Phase 6's section on why). Serving one request at a time sidesteps all of
-that entirely, at the honest cost of only ever running one query
-concurrently — an acceptable trade for a demo API, not a claim that this
-is how a production read replica should be built.
-
-**Catalog non-persistence (documented in Phase 6) becomes directly visible
-here, and is solved with a startup-only mechanism that keeps the network
-API's read-only property intact.** Since `Database`'s catalog is
-in-memory and rebuilt empty on every construction, a fresh
-`dbengine_httpd` process has no way to know a table exists — even when
-the row bytes a separate CLI session wrote are still sitting on disk at
-the path it opened. `dbengine_httpd` takes an optional third argument, a
-path to a file of setup statements (typically `CREATE TABLE` and
-`INSERT`), run once via `Database::Execute` *before* the HTTP listener
-starts accepting connections. This is not a backdoor around "read-only
-over the network": nothing in it runs in response to a request, and it's
-driven entirely by a local file the operator controls at process startup,
-the same trust boundary as passing a config file to any server. Discovered
-by testing the deployed shape end-to-end rather than just the unit-level
-API — a fresh `dbengine_httpd` pointed at a file a CLI session had already
-populated returned `"no such table"` for every query until this was added,
-which is exactly the kind of gap a phase built around "run all these
-pieces together for real" is supposed to surface.
-
-**A genuine concurrency bug was found and fixed while writing this
-phase's tests, not the engine's core logic: `HttpServer::Run()`
-unconditionally set its running-flag to `true` as its first statement,
-racing against `Stop()` if the two ever happened out of order.** The
-intended lifecycle is: construct `HttpServer`, spawn a thread running
-`Run()`, and later call `Stop()` from another thread to end it. If
-`Stop()` executed *before* the spawned thread was actually scheduled to
-begin `Run()` — entirely possible, and increasingly likely the less other
-work a test does between spawning the thread and calling `Stop()` — the
-old code would have `Run()` silently overwrite `running_` back to `true`
-after `Stop()` had already set it `false`, and the accept loop would
-never exit. This didn't show up in ad hoc manual testing (starting the
-server, `curl`-ing it, then sending `SIGTERM` always left enough real
-wall-clock time between start and stop for the race window to close), but
-showed up reliably once `test/http/http_server_test.cpp` exercised the
-same start/stop lifecycle with no artificial delay — closer to how a test
-*should* exercise a start/stop API, and exactly the kind of timing-
-dependent bug that only a real concurrent test (not a single-threaded
-unit test, and not manual testing with human-scale delays) will catch.
-The fix: `running_` starts `true` as the member's default initializer and
-`Run()` never writes `true` to it again — `Stop()` is now a one-way
-`true`→`false` transition with no window in which `Run()`'s own startup
-code can race it, regardless of scheduling order between the two threads.
-
-## Deferred to later phases
-
-- Free-page reuse in `BPlusTree`'s on-disk page ids specifically (SSTables
-  solve their version of this by deleting whole files — see above).
-- Group commit / log-buffer batching for the WAL — logging currently fsyncs
-  once per commit (see BENCHMARKS.md for the throughput cost this carries);
-  batching multiple transactions' commits into one fsync is the standard
-  next step if that cost needs to come down.
+Architectural decisions and trade-offs, phase by phase. References point to
+CMU 15-445 and Hellerstein, Stonebraker & Hamilton, *Architecture of a
+Database System* (2007), used here as an architectural reference only.
+Code is original, not derived from BusTub.
+
+## Phase 0: Disk Manager
+
+- Fixed 4096-byte page size, compile-time constant (`dbengine::PAGE_SIZE`).
+  Matches the common OS page/sector size, so a page read/write is a single
+  aligned I/O. Every layer above (buffer pool, node layouts) sizes against
+  this constant instead of a runtime parameter.
+- `pread`/`pwrite` instead of `seek` + `read`/`write`. Offset is passed per
+  call, so reads/writes to different pages are safe to issue concurrently
+  from multiple threads with no external locking. Matters starting Phase 1,
+  where the buffer pool dispatches concurrent page I/O.
+- Page IDs allocate from a monotonic counter, not a free list. No delete
+  path exists yet in Phase 0, so nothing needs the space back. A free list
+  arrives in later phases once B+-tree merges and LSM compaction produce
+  pages that need reclaiming.
+- Reading an unwritten page zero-fills rather than erroring. A page ID can
+  be reserved before it's written; treating "never written" as zero-filled
+  data keeps the read interface to one call and mirrors sparse-file
+  semantics most filesystems already give for free.
+- No implicit fsync on write. `WritePage` lands in the OS page cache;
+  durability needs an explicit `Sync()`. There's no WAL yet in Phase 0, so
+  no crash-consistency story to enforce. Phase 4's ARIES write-ahead
+  logging rule (log record durable before its data page) is what makes
+  `Sync()` ordering matter later.
+- One heap file for all pages, not per-table files. Matches BusTub and most
+  single-file engines (SQLite included). Table/file mapping doesn't exist
+  until the SQL front-end in Phase 6.
+- Errors are exceptions (`IOException`), not error codes. I/O failures here
+  are unrecoverable precondition violations (bad path, disk full,
+  permissions), not expected control flow.
+
+## Phase 1: Buffer Pool Manager
+
+- LRU-K (k=2) is the production eviction policy, not CLOCK. LRU-K's
+  backward k-distance directly encodes "accessed once" vs "accessed
+  repeatedly": a frame with fewer than k accesses has infinite backward
+  distance and gets evicted first, regardless of how recent that one touch
+  was. CLOCK approximates LRU cheaply but shares the same blind spot.
+  Reference: O'Neil, O'Neil & Weikum, "The LRU-K Page Replacement Algorithm
+  For Database Disk Buffering," SIGMOD 1993.
+- Plain LRU (`LRUReplacer`) exists only as a benchmark baseline, not as a
+  production option. "Beat plain LRU" needs a correct, honest plain-LRU
+  implementation to beat, not a strawman. Shares the same `Replacer`
+  interface as `LRUKReplacer` so the benchmark can run an identical trace
+  through both.
+- `Replacer` and `BufferPoolManager` are split with a narrow interface.
+  `Replacer` only knows frame IDs and evictable/non-evictable; it has no
+  concept of a page or a pin count. `BufferPoolManager` owns that
+  translation and all page/disk state. A CLOCK replacer could drop in
+  later without touching `BufferPoolManager` at all.
+- One mutex over the whole `BufferPoolManager`, not per-page latches. The
+  simplest correct option; there's no concurrent workload requirement until
+  MVCC in Phase 5. Per-page latching is worth doing once there's an actual
+  contention measurement to justify it.
+- No free-page reuse yet. `DeletePage` returns a frame to the internal free
+  list, but the disk page ID is never returned to `DiskManager`. Same
+  deferral as Phase 0. B+-tree merges and LSM compaction in Phase 2/3 will
+  be the first real consumers.
+- `Evict()` is O(evictable frames), not O(1) or O(log n). Both replacers
+  scan their evictable set on every eviction. Visible directly in the
+  benchmark: `BM_Zipfian_LRUK` goes from ~63ms at pool size 8 to ~729ms at
+  pool size 2048, almost all of it the linear scan repeated ~200,000
+  times. Acceptable for now; a priority-queue-backed LRU-K would restore
+  O(1) amortized eviction if pool sizes grow.
+
+## Phase 2: B+-Tree (Engine A)
+
+- `StorageEngine` uses fixed-size `int64_t` keys and byte-string values
+  capped at `MAX_VALUE_SIZE` (64 bytes), enforced by both engines. A real
+  B+-tree with variable-length values needs a slotted page (slot
+  directory, free-space compaction). Capping value size means every leaf
+  entry is `key + length + fixed slot`, a plain C array works as the node
+  layout, and there's no free-space bookkeeping to get wrong. The cap
+  applies to the LSM-tree too (Phase 3), even though its write path
+  doesn't strictly need one, so the head-to-head comparison stays
+  apples-to-apples.
+- Node classes (`BPlusTreePage`, `LeafPage`, `InternalPage`) overlay
+  directly on a `Page`'s byte buffer via `reinterpret_cast`, no
+  serialize/deserialize step. No virtual functions (a vtable pointer would
+  corrupt the on-disk layout). The in-memory representation is the wire
+  format.
+- Node capacity is computed at compile time from `PAGE_SIZE`, with one
+  slot of headroom above the logical `max_size_`. Lets `Insert` write
+  first and check overflow after, instead of a pre-flight capacity check.
+  Default fanout: leaves hold ~54 entries, internal nodes ~254 children,
+  so a 10M-key tree is about 3 levels deep.
+- `Insert` is upsert, not insert-or-fail. `StorageEngine` is meant to work
+  as a real KV store, including what SQL row updates go through in Phase
+  6, so an existing key's value gets overwritten in place. Fixed-size
+  slots mean an update never has to move surrounding entries.
+- One mutex for the whole tree, not latch crabbing. Same simplification as
+  the buffer pool, same reason: no concurrent workload requirement until
+  Phase 5. A `BPlusTree::Iterator` pins its current leaf but doesn't hold
+  the tree mutex between `Next()` calls, so scanning concurrently with a
+  mutation is out of scope for now.
+- Root page ID persistence lives in `BPlusTreeEngine`, not `BPlusTree`.
+  `BPlusTree` just tracks `root_page_id_` in memory. `BPlusTreeEngine`
+  reads it from page 0 on construction and writes it back after any
+  structural change. Keeps `BPlusTree` a pure data structure with no
+  notion of "this is page 0 of a database file."
+- Benchmarks insert in shuffled order, not sequential, with a buffer pool
+  deliberately smaller than the dataset (2,000 frames for both 1M and 10M
+  keys). Sequential insertion is the easy case for a B+-tree (always
+  splitting the rightmost leaf) and would flatter it next to Phase 3's LSM-
+  tree, whose write path doesn't care about key order. Result: point
+  lookup barely moves between 1M and 10M keys; insert throughput drops
+  noticeably at 10M, because the fixed pool is a smaller fraction of the
+  bigger dataset.
+
+## Phase 3: LSM-Tree (Engine B)
+
+- Skip list and Bloom filter are original implementations, not vendored.
+  The constraints allow a vendored header-only version; this project
+  writes its own (`src/lsm/skip_list.h`, `src/lsm/bloom_filter.h`) to keep
+  the whole codebase auditable without a third-party dependency. Skip list
+  follows Pugh (1990). Bloom filter uses double hashing (Kirsch &
+  Mitzenmacher, 2006) to derive k hash functions from two 64-bit mixes.
+- SSTables reuse the fixed-size-value discipline from Phase 2, and it
+  shows up in the numbers. An SSTable data entry has the same layout as a
+  B+-tree leaf entry, for the same reason: bulk-loading a sorted page
+  becomes a flat array fill. Cost: space-amplification numbers are
+  inflated for both engines by padding every value to 64 bytes regardless
+  of actual size.
+- Each SSTable's Bloom filter and sparse index load fully into memory at
+  `Open()`. Only data pages go through a buffer pool, and each SSTable
+  gets its own small dedicated pool (8 frames) rather than one shared
+  cache, since `BufferPoolManager` is keyed by a single file. A shared
+  cache across SSTables is a real simplification relative to production
+  engines (RocksDB's block cache is global), noted as a deferred
+  improvement.
+- Each SSTable is its own file, deleted outright when compacted away.
+  Every other phase defers page reuse because nothing yet both frees pages
+  and needs the space back; compaction is that consumer, and since an
+  SSTable already owns a whole file, deleting it is the simplest correct
+  reclaim path. Lifetime uses `shared_ptr<SSTable>`: a superseded table is
+  marked obsolete and dropped from the engine's reference, but a
+  concurrent reader holding its own `shared_ptr` keeps the file alive
+  until it's done.
+- Flush is synchronous; compaction is a real background thread. `Put`/
+  `Delete` build a new SSTable inline on the caller's thread once the
+  memtable crosses its flush threshold, holding the engine mutex only to
+  swap in a fresh memtable. Compaction runs on a dedicated thread that
+  wakes on a condition variable (or a 100ms poll) and merges a full tier
+  without holding the lock, since the tables being merged are immutable.
+- Tombstones drop only when compacting the bottommost populated tier. A
+  delete can't touch older SSTables in place, so it's recorded as a
+  tombstone that must keep shadowing any older value until nothing older
+  remains. Same rule RocksDB uses.
+- The merge iterator (`LSMMergeIterator`) k-way-merges any set of
+  priority-ordered cursors via a min-heap, producing one entry per key
+  including tombstones. `Scan()` filters tombstones out; compaction
+  consumes the raw stream and applies the tombstone-drop rule above.
+  Priority order is memtable, then each tier newest to oldest, matching
+  what `Get()` uses, so point lookups and range scans never disagree on
+  which source wins a key.
+- **Bug found by stress testing**: the background compaction thread could
+  be starved by a fast foreground write loop, growing a tier past its
+  manifest capacity. A tight write loop with no I/O wait let the thread
+  releasing a lock consistently win the race to reacquire it over a thread
+  parked on a condition variable, a classic starvation pattern.
+  `LSMTreeEngineTest.RandomizedOperationsMatchStdMapOracle` (20,000
+  tight-loop ops) crashed about 1 run in 20 with "exceeded manifest
+  per-tier capacity."
+  - Fix: backpressure, not a bigger capacity number. `kWriteStallTierSize`
+    is checked after every flush; if crossed, the writer itself calls
+    `CompactOneTierIfNeeded()`, guarded by a `compaction_running_` flag so
+    two callers never duplicate the same merge. Same approach RocksDB uses
+    for write stalls.
+  - This kind of bug doesn't show up in a fixed-seed unit test, only a
+    stress-repeated one. Relevant again for Phase 5's MVCC work, which has
+    more concurrency surface than this.
+- Manifest capacity is a fixed-size array (8 tiers x 16 SSTables/tier), not
+  a growable log. Enough headroom for this project's tests and benchmarks.
+  A real scale limit, flagged rather than fixed since nothing in scope
+  exercises it. Production systems use a growable append-only manifest
+  (RocksDB's `MANIFEST` file).
+- No WAL yet for the LSM-tree either, same phased deferral as the B+-tree.
+  A crash loses whatever's in the active memtable since the last flush.
+  The destructor does flush on a clean shutdown, so close-then-reopen
+  behaves correctly; it's specifically crash durability that waits for
+  Phase 4.
+
+## Phase 4: Write-Ahead Log & ARIES-Style Recovery
+
+- Logging is logical, not physical. An UPDATE record says "Put(key,
+  new_value)" or "Delete(key)" happened, carrying the prior value undo
+  would need. Two reasons this is the right call, not a shortcut:
+  - Records stay small and fixed-size (capped by `MAX_VALUE_SIZE`), so the
+    WAL reuses the same "pack fixed-size records into pages" pattern used
+    everywhere else in this codebase.
+  - The ARIES paper itself prescribes logical undo for tree-structured
+    indexes specifically: a physical "restore these exact bytes" stops
+    making sense once a subsequent split or merge has changed the page's
+    layout.
+  - Trade-off: replay must be deterministic (true here, since split/merge
+    behavior is a pure function of `max_size_` and insertion history), and
+    there's no per-page LSN or dirty-page table to maintain.
+- No per-page LSNs, no dirty-page table. Checkpoints are "sharp" instead.
+  `DoCheckpoint()` flushes every dirty page before recording anything, a
+  synchronous pause-the-world checkpoint. Trades checkpoint cost
+  (proportional to dirty pages held) for a recovery algorithm that skips a
+  whole bookkeeping structure. Worth revisiting only if a benchmark shows
+  checkpoint pauses hurting foreground latency; none has yet.
+- **Bug found by the recovery-time benchmark**: recovery time was bounded
+  by total log size, not log-since-checkpoint, silently defeating the
+  point of checkpointing.
+  - `RecoverOnStartup()` located the last checkpoint by scanning the
+    entire log forward with `LogManager::ReadAll()`, then trimmed the
+    actual redo work correctly from there. The trim was right; the scan
+    to find the checkpoint wasn't bounded, and dominated recovery time.
+  - The benchmark built specifically to prove "checkpoints bound recovery
+    time" instead showed recovery time still scaling linearly with total
+    log size, checkpoints or not.
+  - Fix: persist the last checkpoint's `CHECKPOINT_BEGIN` LSN in the
+    engine's metadata page. Recovery reads that one field and jumps
+    straight to the checkpoint instead of scanning for it.
+- Undo is per-transaction and independent, not ARIES's globally
+  LSN-interleaved order. Real ARIES processes all losers' undo actions in
+  strict descending LSN order globally, because physical undo needs to
+  respect page-latching dependencies between transactions. This project's
+  undo is logical and key-scoped, so undoing each loser transaction fully,
+  one at a time, is still correct. Every compensating action writes a CLR
+  carrying an `undo_next_lsn`, so an undo interrupted by a second crash
+  resumes correctly instead of redoing the compensation.
+- The B+-tree gets the full ARIES treatment; the LSM-tree gets a smaller,
+  asymmetric one, on purpose.
+  - `WALBPlusTreeEngine` adds explicit multi-operation transactions
+    (`Begin`/`Put`/`Delete`/`Get`/`Commit`/`Abort`) specifically so `Abort`
+    (and recovery's Undo phase) has something real to demonstrate.
+  - `LSMTreeEngine`'s optional WAL (default off) is redo-only: log before
+    applying to the memtable, replay on restart. No transaction concept,
+    no undo, because an SSTable is atomic by construction and the memtable
+    is pure in-memory state a crash erases regardless.
+- **A correctness bug avoided by design, not fixed after the fact**:
+  truncating a single shared memtable-WAL file races against concurrent
+  writers. The first design (one WAL file per memtable, truncated on
+  flush) has a real data-loss window between swapping in a fresh memtable
+  and the flush finishing. Fix: a per-generation WAL file
+  (`db_path + ".memwal" + generation`), rotated atomically with the
+  memtable swap, so a flush only ever deletes the generation it just
+  durably flushed.
+- The crash-injection harness uses a real `fork`/`SIGKILL`, not an
+  in-process simulation. A C++ object going out of scope in the same
+  process always runs its destructor, so an in-process "simulated crash"
+  can't prove the WAL did anything (the graceful path saves data either
+  way). The harness forks a real worker, lets it run 1-50ms, sends
+  `SIGKILL`.
+  - Building the oracle for this surfaced its own bug: logging "commit
+    confirmed" to a side file *after* the engine call returns races the
+    kill, producing spurious failures that looked like engine bugs. Fix:
+    bracket every attempt with fsynced 'A' (before) and 'C' (after)
+    markers; only a trailing unmatched 'A' is genuinely ambiguous.
+
+## Phase 5: MVCC Concurrency
+
+- `MVCCStore` is deliberately not a `StorageEngine`. The `Get`/`Put`/
+  `Delete`/`Scan` interface has no concept of a transaction boundary or
+  isolation level, and demonstrating those is the point of this phase.
+  `MVCCStore` sits beside the disk engines as a separate, in-memory
+  component with its own API (`Begin`/`Read`/`Write`/`Delete`/`Commit`/
+  `Abort`). Combining it with disk-backed WAL durability would be a
+  separate project, not a natural extension.
+- Snapshot isolation does not prevent write skew, and this project shows
+  that honestly instead of papering over it.
+  - It's an established result (Berenson et al., "A Critique of ANSI SQL
+    Isolation Levels," 1995; Fekete et al., "Making Snapshot Isolation
+    Serializable," 2005) that plain snapshot isolation closes dirty reads
+    and non-repeatable reads but not write skew, because it only checks
+    write-write conflicts.
+  - Rather than contradict that theory or build full Cahill-et-al.
+    Serializable Snapshot Isolation (a much larger undertaking), this
+    project implements four isolation levels with an explicit table of
+    what each one closes:
+
+    | Isolation level | Dirty read | Non-repeatable read | Write skew |
+    |---|---|---|---|
+    | `READ_UNCOMMITTED` | visible | visible | visible |
+    | `READ_COMMITTED` | prevented | visible | visible |
+    | `SNAPSHOT` | prevented | prevented | visible (textbook SI) |
+    | `SERIALIZABLE_SNAPSHOT` | prevented | prevented | prevented |
+
+  - `SERIALIZABLE_SNAPSHOT` is a simplified, conservative SSI-lite: at
+    commit time it also checks the read set for conflicting writes, which
+    catches the classic two-key write-skew pattern without a full
+    rw-antidependency graph. It rejects some transactions a full SSI
+    implementation would allow. See `WriteSkew*` tests in
+    `mvcc_store_test.cpp`.
+- Version chains, not a single mutable slot. Each key maps to a
+  `VersionChain`, a `std::list<Version>` behind its own mutex. `list` is
+  chosen specifically so a transaction can hold a stable iterator into it,
+  giving O(1) commit and abort instead of a linear re-search. Each
+  `Version` carries a `seq` (write-time order, what `READ_UNCOMMITTED`
+  uses) and a `commit_ts` (commit-time order, what the other levels use).
+  Read-your-own-writes is unconditional: `Read()` always checks the
+  caller's own pending version first, regardless of isolation level.
+- Commit-time conflict detection is first-committer-wins, with chains
+  locked in sorted key order to avoid deadlock. `Commit()` collects every
+  key to check (write set always, read set too under
+  `SERIALIZABLE_SNAPSHOT`), sorts and dedups them, then locks each chain in
+  that order. Two transactions committing concurrently over overlapping
+  keys always acquire locks in the same relative order, ruling out
+  classic A-waits-for-B-waits-for-A deadlock with no detector needed.
+- Garbage collection tracks every active transaction's `start_ts`, not
+  just the oldest one.
+  - The first version computed a single minimum `start_ts` and reclaimed
+    anything older. Safe, but needlessly conservative: it kept every
+    version between the oldest reader's boundary and the newest, even ones
+    no active reader could see.
+  - The final version computes the full set of active `start_ts` values
+    and reclaims a committed version exactly when no active transaction's
+    `start_ts` falls in the half-open interval where that version is the
+    answer. See `GarbageCollectionRespectsActiveSnapshot`.
+- **Bug found by the throughput benchmark**: a single global mutex
+  guarding the whole transaction table undid the point of fine-grained
+  MVCC locking.
+  - Every autocommit transaction does one `Begin` (insert) and one
+    `Commit` (erase) against the transaction table. With one mutex, that
+    table was contended on nearly every operation regardless of which key
+    it touched, so the per-key `VersionChain` locking never mattered.
+  - Measured effect: throughput fell from 1 to 4 threads (450k/s to
+    168k/s) instead of holding steady, the opposite of what fine-grained
+    locking should do.
+  - Fix: shard the transaction table into 16 independently-locked shards
+    keyed by `txn_id % 16`, the same technique the buffer pool and LSM-tree
+    already use. Throughput holds flat from 1 to 4 threads after the fix.
+- Concurrency-safety contract: one thread drives a given `txn_id` at a
+  time. `Begin`/`Read`/`Write`/`Delete`/`Commit`/`Abort` are never called
+  concurrently for the same `txn_id` from two threads, a standard
+  one-thread-per-session model. This is what lets a `Transaction`'s own
+  fields be touched without a per-transaction lock once looked up under
+  its shard's mutex.
+
+## Phase 6: SQL Front-End & Tiny Optimizer
+
+- Every table shares one `StorageEngine` instance instead of getting its
+  own file. `Database` opens a single engine; each table's rows live in a
+  slice of its `int64_t` keyspace: the top 16 bits hold a table ID, the
+  rest hold the row's primary key. Ascending key order groups each
+  table's rows contiguously, which is what lets `Executor` start a scan at
+  a table's first key and stop the moment the table ID changes, with no
+  engine-level notion of a table boundary. Real limit: at most 2^16
+  tables, 2^48 rows each, both generous here but not production-grade.
+- The primary key is the only column the planner can index, because
+  `KeyType` is a single `int64_t` across the whole project. `CREATE TABLE`
+  requires the first column to be `INTEGER` and treats it as the row's
+  storage key. With exactly one indexed column, access-path selection
+  collapses to three cases:
+  - Equality on the primary key: `POINT_LOOKUP`.
+  - A bound (`<`, `<=`, `>`, `>=`) on the primary key: `RANGE_SCAN`.
+  - Neither: `FULL_SCAN`.
+  Every comparison not implied by the chosen path travels along as a
+  residual filter applied after fetching, so a plan is always correct even
+  when it's not maximally selective.
+- No secondary indexes, so planning never considers more than one access
+  path per table. That's the specific scope cut that keeps this a "tiny"
+  optimizer. A real cost-based optimizer chooses among multiple candidate
+  indexes by estimated selectivity, decides join order across tables, and
+  uses cardinality estimates. None of that has anywhere to attach without
+  secondary indexes or multi-table queries (see Deferred).
+- Grammar is a small subset: `CREATE TABLE` / `INSERT` / `SELECT` /
+  `DELETE`, `WHERE` limited to an AND-conjunction of comparisons. No
+  `UPDATE`, no `OR`, no joins, no subqueries, no aggregates.
+  - `UPDATE` is absent by design: every `Put` is already an upsert, so
+    re-inserting an existing primary key overwrites the row.
+    `DatabaseTest.UpdateSemanticsViaReinsert` locks that behavior in.
+  - AND-only `WHERE` keeps bound-intersection a simple min/max fold. `OR`
+    between primary-key bounds would need a union of ranges, a reasonable
+    next step but real added complexity for a phase about access-path
+    choice, not expression evaluation.
+- Row encoding is fixed and non-nullable, sized to fit `MAX_VALUE_SIZE`
+  (64 bytes), the same cap both storage engines already enforce. The
+  primary key is never part of the payload since it's already the storage
+  key, buying back 8 bytes. `INTEGER` columns encode as 8 raw bytes,
+  `TEXT` as a 2-byte length prefix plus bytes. `Database::ExecuteInsert`
+  raises a `SqlException` (not a generic `IOException`) the moment a row
+  would exceed the cap.
+- The catalog is in-memory only and doesn't persist across a `Database`
+  restart on the same file. Intentional scope cut, not an oversight: the
+  row data itself is durable (the underlying engine is disk-backed), but
+  reinterpreting it correctly again requires re-issuing the same `CREATE
+  TABLE` statements in the same order. Every test and the CLI's `sql`
+  command only ever use one `Database` per process lifetime, so this
+  doesn't block correctness demonstration.
+- The CLI's `sql` command uses a separate file (`db_path + ".sql"`), never
+  the file the raw `alloc`/`write`/`read` commands touch. Those write
+  directly through `DiskManager` with no notion of the SQL layer's key
+  prefixing; sharing a file would let the two corrupt each other silently.
+
+## Phase 7: Validation, Differential Testing & TPC-Style Workloads
+
+- Linking a real SQLite for differential testing doesn't violate "no
+  external database libraries," because that rule is about what ships in
+  the engine, not what validates it. SQLite is pulled in via
+  `find_package(SQLite3)` only inside `if(DBENGINE_BUILD_TESTS)`, and only
+  the test binary links it, the same role GoogleTest and Google Benchmark
+  already play. The Docker image (built with tests off) has zero SQLite
+  dependency, confirmed directly with `ldd`.
+- No translation layer is needed for the SQL text itself, since this
+  project's grammar is a strict syntactic subset of real SQL. One semantic
+  bridge is needed though: primary-key uniqueness.
+  - This project's grammar treats column 0 as an implicit, always-enforced
+    primary key. Bare `id INTEGER` in standard SQL is just a plain column
+    with no uniqueness at all.
+  - **What this looked like as a bug**: the first version of the
+    differential test sent identical text to both sides. After a
+    randomized insert/delete sequence, SQLite reported far more rows than
+    this engine for the same key, e.g. three rows with `id = 114` where
+    the engine held exactly one. Not a bug: SQLite did exactly what was
+    asked, since nothing told it `id` had to be unique. This is the value
+    of differential testing against an independent implementation: it
+    surfaces assumptions a test author could otherwise bake into both
+    sides without noticing.
+  - Fix: rewrite only `CREATE TABLE` and `INSERT` before sending them to
+    SQLite. `INTEGER` on the first column becomes `INTEGER PRIMARY KEY`;
+    `INSERT` becomes `INSERT OR REPLACE`. `SELECT` and `DELETE` are sent
+    unmodified.
+- The randomized differential test avoids two of this project's own
+  documented scope limits rather than treating them as SQLite
+  disagreements: generated primary keys stay non-negative, and generated
+  `TEXT` payloads stay under `MAX_VALUE_SIZE`. Both are already covered by
+  dedicated Phase 6 tests.
+- "TPC-C-style" and "TPC-H-style" mean inspired by, not compliant with,
+  the official specs. Real TPC-C has five transaction types with audited
+  response-time percentiles; TPC-H has 22 analytical queries, most with
+  joins and aggregates. This project's SQL layer has none of `UPDATE`,
+  joins, `GROUP BY`, or aggregates, so literal compliance isn't achievable
+  without building substantially more of a SQL engine.
+  - TPC-C-inspired (`benchmark/tpcc_bench.cpp`): warehouse/customer/stock/
+    orders/order_line tables, composite keys flattened to a single
+    `INTEGER` by arithmetic, a simplified New-Order transaction. Not
+    wrapped in a real multi-statement transaction, since the SQL layer
+    doesn't expose `Begin`/`Commit` yet.
+  - TPC-H-inspired (`benchmark/tpch_bench.cpp`): a single 300,000-row
+    fact table and a Q1-style filter swept across selectivity.
+    `l_shipdate` is scattered relative to the primary key so no
+    insertion-order trick beats a genuine `FULL_SCAN`.
+
+## Phase 8: Deployment
+
+- Three deliverables, each a thin layer over work already done. This
+  phase adds no new storage-engine ideas, only reachability.
+  - A GHCR image (`.github/workflows/publish.yml`) builds the same
+    `Dockerfile` the CI workflow already validates and publishes it using
+    the repo's automatic `GITHUB_TOKEN`.
+  - A static results page (`docs/index.html`) is hand-written HTML/CSS
+    transcribing BENCHMARKS.md's headline numbers. No generator, no
+    client-side JS, no external CDN.
+  - A read-only HTTP API (`src/http/`) is a thin front-end over
+    `Database::Execute`, restricted to `SELECT`, reusing the Phase 6
+    parser/planner/executor unchanged.
+- The HTTP API is raw POSIX sockets, not an external web framework, for
+  the same reason the SQL layer has its own lexer instead of a
+  parser-generator: a demo-scale server (two routes, GET-only, no
+  keep-alive) is well within what's reasonable to hand-write. `HttpServer`
+  parses just enough of an HTTP/1.1 request to route `GET /health` and
+  `GET /query?sql=...`, with a small hand-written JSON serializer for
+  `QueryResult`.
+- Read-only is enforced by parsing every request twice: once by
+  `HttpServer` to check the statement type, once by `Database::Execute` to
+  run it. Anything that isn't a `SelectStmt` gets a 400 before it reaches
+  the engine at all. A double parse costs microseconds against network I/O
+  that costs milliseconds.
+- Single-threaded, one connection at a time, by design. `Database` was
+  never built for concurrent access (no locking in `Catalog`,
+  `EncodeRow`/`DecodeRow`, or the executor), and `MVCCStore` (Phase 5's
+  answer to concurrency) is a separate component the SQL layer doesn't sit
+  on. Serving one request at a time sidesteps that entirely, at the cost
+  of running only one query at a time. Acceptable for a demo API, not a
+  claim about production read replicas.
+- Catalog non-persistence (documented in Phase 6) becomes directly
+  visible here: a fresh `dbengine_httpd` process has no way to know a
+  table exists even when the row bytes are on disk. Fix: `dbengine_httpd`
+  takes an optional schema-file argument, run once via `Database::Execute`
+  before the listener starts. Nothing in it runs in response to a request,
+  so the API's read-only property holds. Found by testing the deployed
+  shape end to end: a fresh process pointed at data a CLI session had
+  already populated returned "no such table" for every query until this
+  was added.
+- **Bug found by the HTTP server's own test suite, not manual testing**:
+  `HttpServer::Run()` unconditionally set its running-flag to `true` as
+  its first statement, racing `Stop()` if `Stop()` executed before the
+  spawned thread actually started `Run()`.
+  - Manual testing (start, `curl`, `SIGTERM`) never hit this, since human-
+    scale delays always closed the race window.
+  - A fast test with no delay between starting and stopping the server
+    hit it reliably: `Stop()` would set the flag false, then `Run()` would
+    start and silently overwrite it back to true, hanging the accept loop
+    forever.
+  - Fix: `running_` starts `true` as the member's default initializer and
+    `Run()` never writes `true` to it again. `Stop()` is a one-way
+    transition with no race window regardless of thread scheduling order.
+
+## Deferred
+
+- Free-page reuse in `BPlusTree`'s on-disk page IDs specifically.
+- Group commit / log-buffer batching for the WAL, to amortize fsync cost
+  across concurrent commits.
 - Per-page latching in `BufferPoolManager`, latch crabbing in `BPlusTree`,
-  and finer-grained locking in `LSMTreeEngine`/`WALBPlusTreeEngine` (all
-  currently one coarse mutex per structure) — `MVCCStore`'s per-key
-  `VersionChain` locking (Phase 5) is this project's one example of what
-  finer-grained locking looks like in practice; revisit the disk engines if
-  contention measurements ever justify the added complexity.
-- Full Cahill-et-al. Serializable Snapshot Isolation (real rw-antidependency
-  graph tracking with dangerous-structure detection) in place of Phase 5's
-  simplified `SERIALIZABLE_SNAPSHOT` — see the Phase 5 section above for
-  exactly what the simplification gives up.
-- MVCC version chains persisted to disk / integrated with the WAL, instead
-  of `MVCCStore` being an in-memory-only component alongside the two disk
-  engines.
-- O(1)/O(log n) eviction for `LRUKReplacer`/`LRUReplacer` (currently linear
-  scan) — revisit if buffer pool sizes grow enough to make it matter; the
-  Phase 2 insert-throughput benchmark is partly bottlenecked on this (each
-  eviction rescans up to 2,000 evictable frames).
-- A shared, global buffer pool cache across all of an LSM-tree's SSTables,
-  instead of one small pool per SSTable file.
-- A growable manifest log instead of a fixed-capacity manifest page (LSM
-  tier manifest) / fixed-capacity checkpoint bracket (WAL).
-- Slotted pages / variable-length values for the B+-tree, if a future phase
-  needs values larger than `MAX_VALUE_SIZE` without a separate heap page.
-- Fuzzy (non-blocking) checkpoints for the WAL, if sharp checkpoints'
-  pause-the-world cost ever shows up as a real foreground-latency problem.
-- A persisted catalog (table schemas surviving a `Database` restart on the
-  same file) — see the Phase 6 section above for exactly what re-opening
-  requires without it.
-- Secondary indexes, `UPDATE`, `OR`/parenthesized `WHERE` expressions,
-  joins, aggregates, and NULL-able columns in the SQL layer — see the
-  Phase 6 section above for why each was cut and what it would take to add.
-  Secondary indexes specifically are the one that would change the
-  optimizer from "tiny" to something closer to real: with more than one
-  indexed column per table, `PlanQuery` would need actual cost comparison
-  between candidate access paths instead of "is there a primary-key
-  predicate or not."
-- One `StorageEngine`/file per SQL table instead of the shared, table-id-
-  prefixed keyspace every table currently lives in — see the Phase 6
-  section above for the capacity limits that trade-off accepts.
-- Transactional SQL statements (wrapping the SQL layer's `Insert`/`Delete`
-  in `WALBPlusTreeEngine`- or `MVCCStore`-style `Begin`/`Commit`/`Abort`,
-  giving multi-statement atomicity, isolation, and crash recovery to the
-  SQL front-end) — Phases 4 and 5 built both underlying mechanisms; wiring
-  either into the SQL layer is a natural but nontrivial follow-up this
-  phase deliberately left for later so it could focus on parsing and
-  planning. Phase 7's TPC-C-inspired benchmark runs each New-Order
-  "transaction" as a sequence of independently-committed statements for
-  exactly this reason.
-- Literal TPC-C/TPC-H compliance (the full five-transaction TPC-C mix with
-  audited response-time percentiles; TPC-H's join- and
-  `GROUP BY`-dependent query set) — see the Phase 7 section above for
-  exactly what stands in the way (no `UPDATE`, joins, or aggregates) and
-  what was built instead.
-- Joins, `GROUP BY`, and aggregate functions in the SQL layer generally —
-  the single largest gap between this project's grammar and being able to
-  run real TPC-H, called out specifically in the Phase 7 section above.
-- Multi-threaded request handling for `HttpServer` — deliberately
-  single-connection-at-a-time for now (see the Phase 8 section above for
-  why); would need `Database`/`Catalog` to grow real concurrency support
-  first, not just a bigger thread pool in the server.
-- Persisted catalog for `dbengine_httpd`'s benefit specifically — the
-  schema-file startup mechanism (Phase 8) is a workaround for the same gap
-  Phase 6 already documented, not a fix for it; a real fix (see Phase 6's
-  Deferred entry above) would make the startup file unnecessary.
-- HTTPS/TLS, authentication, and rate-limiting for the HTTP API — it's an
-  explicitly *demo-scale* read-only API over plain HTTP, not hardened for
-  exposure beyond a trusted network; a resource-exhaustion query (an
-  unbounded `FULL_SCAN` against a large table) is one `curl` away from
-  anyone who can reach it.
+  finer-grained locking in `LSMTreeEngine`/`WALBPlusTreeEngine`.
+  `MVCCStore`'s per-key locking is this project's one example of what that
+  looks like in practice.
+- Full Cahill-et-al. Serializable Snapshot Isolation, in place of Phase
+  5's simplified `SERIALIZABLE_SNAPSHOT`.
+- MVCC version chains persisted to disk / integrated with the WAL.
+- O(1)/O(log n) eviction for the replacers, currently a linear scan.
+- A shared, global buffer pool cache across an LSM-tree's SSTables,
+  instead of one small pool per file.
+- A growable manifest log instead of a fixed-capacity manifest page, and a
+  growable checkpoint bracket for the WAL.
+- Slotted pages / variable-length values for the B+-tree.
+- Fuzzy (non-blocking) checkpoints for the WAL.
+- A persisted catalog, so SQL tables survive a `Database` restart.
+- Secondary indexes, `UPDATE`, `OR`/parenthesized `WHERE`, joins,
+  aggregates, and nullable columns in the SQL layer. Secondary indexes
+  specifically are what would move the optimizer from "tiny" to real.
+- One `StorageEngine`/file per SQL table, instead of the shared table-ID
+  keyspace every table currently lives in.
+- Transactional SQL statements: wiring the WAL's or MVCC's `Begin`/
+  `Commit`/`Abort` into the SQL front-end for real multi-statement
+  atomicity and isolation.
+- Literal TPC-C/TPC-H compliance, and the joins/`GROUP BY`/aggregates that
+  would require.
+- Multi-threaded request handling for `HttpServer`, which needs
+  `Database`/`Catalog` to grow real concurrency support first.
+- A real fix for `dbengine_httpd`'s schema-file workaround: a persisted
+  catalog would make the startup file unnecessary.
+- HTTPS/TLS, authentication, and rate-limiting for the HTTP API, which is
+  explicitly demo-scale today.
+
+## References
+
+- CMU 15-445/645, *Database Systems* (Andy Pavlo). Course structure and
+  BusTub's project sequence, used as an architectural reference only.
+- Hellerstein, Stonebraker & Hamilton, *Architecture of a Database
+  System*, Foundations and Trends in Databases (2007).
+- O'Neil, O'Neil & Weikum, "The LRU-K Page Replacement Algorithm For
+  Database Disk Buffering," SIGMOD 1993.
+- Pugh, "Skip Lists: A Probabilistic Alternative to Balanced Trees,"
+  Communications of the ACM (1990).
+- Kirsch & Mitzenmacher, "Less Hashing, Same Performance: Building a
+  Better Bloom Filter," ESA 2006.
+- Mohan et al., "ARIES: A Transaction Recovery Method Supporting
+  Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead
+  Logging," ACM TODS (1992).
+- Berenson et al., "A Critique of ANSI SQL Isolation Levels," SIGMOD 1995.
+- Fekete et al., "Making Snapshot Isolation Serializable," ACM TODS (2005).
+- Cahill, Rohm & Fekete, "Serializable Isolation for Snapshot Databases,"
+  SIGMOD 2008.
