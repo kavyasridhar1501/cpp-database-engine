@@ -29,18 +29,10 @@ correctness claim is backed by a test, including:
 - A differential-testing suite that runs identical SQL against this engine
   and a real SQLite and checks the answers agree.
 
-Architecture is informed by CMU 15-445 and Hellerstein, Stonebraker &
-Hamilton's *Architecture of a Database System* (2007). Code is original,
-not derived from BusTub.
-
 - Trade-off reasoning for every decision: [DESIGN.md](DESIGN.md)
 - Every benchmark result and how to reproduce it: [BENCHMARKS.md](BENCHMARKS.md)
 
 ## Demo
-
-No GUI, no hosted instance. This is a systems project, run it locally.
-See [Installation / Setup](#installation--setup) and [Usage](#usage) below
-for the exact steps.
 
 ### SQL shell
 
@@ -102,27 +94,23 @@ $ ./build/test/dbengine_tests --gtest_filter='*SqliteDifferentialTest*' -v
 
 ## Features
 
-- Two storage engines behind one `StorageEngine` interface: a disk-backed
-  B+-tree (page-overlaid nodes, splits/merges, range scans) and an
-  LSM-tree (skip-list memtable, Bloom-filtered SSTables, size-tiered
-  compaction). Swappable, and benchmarked head-to-head.
-- A buffer pool manager with LRU-K eviction. Beats plain LRU on a Zipfian
-  access trace at every pool size tested.
-- ARIES-style write-ahead logging and crash recovery: logical redo/undo,
-  Compensation Log Records, checkpointing, an Analysis-Redo-Undo restart
-  algorithm. Validated with a real `fork()`/`SIGKILL()` crash-injection
-  harness, not a simulated crash.
-- MVCC with four isolation levels. A deterministic test suite makes dirty
-  reads, non-repeatable reads, and write skew appear under weak isolation
-  and vanish under the appropriate stronger one.
-- A small SQL front-end with a real access-path optimizer: a hand-written
-  lexer and recursive-descent parser, and a planner that picks between a
-  point lookup, a range scan, or a full scan based on the query's `WHERE`
-  clause. Worth ~3,700x at 100k rows in the benchmark that proves it.
-- Differential testing against a real SQLite, plus TPC-C/TPC-H-inspired
-  workloads, for validation beyond this project's own test suite.
-- A read-only HTTP API and a Docker image you can build and run locally.
-  See [Usage](#usage).
+- **Two storage engines, one interface.** A disk-backed B+-tree and an
+  LSM-tree, swappable behind `StorageEngine`, benchmarked head-to-head.
+- **LRU-K buffer pool.** Beats plain LRU on a Zipfian trace at every pool
+  size tested.
+- **ARIES-style crash recovery.** Logical redo/undo, checkpointing,
+  restart recovery, validated with a real `SIGKILL` crash-injection
+  harness.
+- **MVCC, four isolation levels.** Dirty reads, non-repeatable reads, and
+  write skew appear under weak isolation and vanish under the right
+  stronger one, deterministically.
+- **A tiny SQL front-end with a real optimizer.** Picks between a point
+  lookup, range scan, or full scan based on `WHERE`. ~3,700x faster at
+  100k rows when it picks right.
+- **Validated beyond its own tests.** Differential testing against real
+  SQLite, plus TPC-C/TPC-H-inspired workloads.
+- **A read-only HTTP API and a Docker image**, both runnable locally. See
+  [Usage](#usage).
 
 ## Tech stack
 
@@ -243,11 +231,11 @@ Everything configures via CMake options or command-line arguments:
 | HTTP API db file / port / schema file | `dbengine_httpd [db-file] [port] [schema-file]` | `dbengine_httpd.db` / `8080` / none |
 
 The HTTP API's schema file exists because the SQL layer's catalog is
-in-memory only and doesn't persist across a restart (see DESIGN.md,
-Phase 6 and 8). Without it, a freshly started `dbengine_httpd` has no way
-to know what tables exist on disk. It loads once, locally, before the
-server starts listening. Nothing about it is reachable over the network,
-so the read-only guarantee holds regardless.
+in-memory only and doesn't persist across a restart. Without it, a
+freshly started `dbengine_httpd` has no way to know what tables exist on
+disk. It loads once, locally, before the server starts listening; nothing
+about it is reachable over the network, so the read-only guarantee holds
+regardless. Details: [DESIGN.md](DESIGN.md).
 
 ## Architecture
 
@@ -291,15 +279,10 @@ flowchart TB
 
 - Every table in the SQL layer shares one `StorageEngine` instance,
   namespaced by a table-id key prefix, instead of owning its own file.
-  Kept Phase 6 focused on parsing and planning rather than per-table file
-  management. See DESIGN.md.
 - `MVCCStore` is not wired into the SQL layer. It's a separate, in-memory
-  component demonstrating snapshot isolation on its own terms. The disk
-  engines' durability story (WAL/ARIES) and MVCC's concurrency story are
-  solved independently, not combined. See DESIGN.md.
+  component demonstrating snapshot isolation on its own terms.
 
-For the reasoning behind every box in this diagram, see
-[DESIGN.md](DESIGN.md), one section per phase.
+Full reasoning per phase: [DESIGN.md](DESIGN.md).
 
 ## Testing
 
@@ -307,136 +290,66 @@ For the reasoning behind every box in this diagram, see
 ctest --test-dir build --output-on-failure
 ```
 
-201 tests, organized around a few techniques rather than just line
-coverage (no `gcov`/`lcov` report wired up yet, see
-[Roadmap](#roadmap--future-work)):
+201 tests (no line-coverage report yet, see [Future Work](#future-work)):
 
-- Randomized oracle tests for every storage engine (B+-tree, LSM-tree, the
-  SQL layer against both) and for `MVCCStore`. Thousands of random
-  `Insert`/`Delete`/`Get` operations checked against a reference
-  `std::map` or `std::vector`.
-- A crash-injection harness (`test/crash/`). Forks a real worker process,
-  lets it run 1-50ms, sends a real `SIGKILL`, verifies recovered state
-  against an independent oracle log. 150 cycles against the B+-tree, 100
-  against the LSM-tree, every push. Not a simulated crash: an in-process
-  "pretend crash" can't bypass RAII cleanup the way a real `kill -9` does.
-- Differential testing against a real SQLite (`test/validation/`,
-  test-only dependency). Identical SQL text run against both engines,
-  results compared directly, including a 2,000-operation randomized
-  fuzzer.
-- Deterministic concurrency tests. Forced interleavings that make dirty
-  reads, non-repeatable reads, and write skew appear under weak isolation
-  and vanish under the correct stronger one, plus a real multi-threaded
-  no-lost-updates stress test for MVCC.
-- A real-socket HTTP test suite covering routing, JSON responses,
-  read-only enforcement, and error handling. Caught a genuine
-  `Stop()`/`Run()` race condition the engine's own logic never had. See
-  DESIGN.md.
+- **Randomized oracle tests** for every storage engine and `MVCCStore`,
+  checked against a reference `std::map`/`std::vector`.
+- **Crash-injection harness**: real `fork`/`SIGKILL` cycles, 150 runs
+  against the B+-tree, 100 against the LSM-tree, every push.
+- **Differential testing** against real SQLite, including a
+  2,000-operation randomized fuzzer.
+- **Deterministic concurrency tests**: forced interleavings for dirty
+  reads, non-repeatable reads, and write skew, plus a multithreaded
+  no-lost-updates stress test.
+- **Real-socket HTTP tests**: routing, JSON responses, read-only
+  enforcement. Caught a real `Stop()`/`Run()` race condition
+  ([DESIGN.md](DESIGN.md)).
 
-## Roadmap / Future work
+## Future Work
 
-All 8 planned phases are complete. Deferred work, full reasoning in
-[DESIGN.md](DESIGN.md)'s Deferred section:
+All 8 planned phases are complete. Deferred, in [DESIGN.md](DESIGN.md):
 
-- Secondary indexes, `JOIN`, `GROUP BY`/aggregates, and `UPDATE` in the SQL
-  layer. The largest gap between this project's grammar and a real SQL
-  engine, or literal TPC-H compliance.
-- A persisted catalog, so SQL tables survive a `Database` restart without
-  re-running `CREATE TABLE`.
-- Transactional SQL statements: wiring the WAL's or MVCC's
-  `Begin`/`Commit`/`Abort` into the SQL front-end.
-- Full Cahill-et-al. Serializable Snapshot Isolation, replacing the
-  simplified `SERIALIZABLE_SNAPSHOT` check.
+- Secondary indexes, `JOIN`, `GROUP BY`/aggregates, `UPDATE` in the SQL layer.
+- A persisted catalog, so SQL tables survive a `Database` restart.
+- Transactional SQL statements via the WAL's or MVCC's `Begin`/`Commit`/`Abort`.
+- Full Cahill-et-al. Serializable Snapshot Isolation.
 - Group commit / log-buffer batching for the WAL.
-- Finer-grained locking in the disk engines. `MVCCStore`'s per-key locking
-  is this project's one example of what that looks like.
-- Line/branch coverage reporting (`gcov`/`lcov`) in CI.
-- Authentication, TLS, and rate-limiting for the HTTP API, which is
-  explicitly demo-scale, not hardened for exposure beyond a trusted
-  network.
-
-## Contributing
-
-This started as a solo, phase-by-phase learning project. Issues and pull
-requests are welcome.
-
-- Branching: fork the repo and branch off `main`
-  (`feature/<short-name>` or `fix/<short-name>`). The project's own
-  history uses one branch per development phase; that's not a required
-  convention.
-- Before opening a PR: `ctest --test-dir build --output-on-failure` must
-  be green, and the build must stay warning-clean (`-Wall -Wextra
-  -Wpedantic`, already the default). Add tests in the same style as the
-  existing suite, a randomized oracle test for a storage engine change, a
-  deterministic interleaving test for a concurrency change.
-- Code style: minimal comments, only for non-obvious *why*, never
-  restating *what* the code does. No speculative abstraction ahead of an
-  actual second use case. A design note in [DESIGN.md](DESIGN.md) for any
-  non-trivial trade-off.
-- Scope: for anything from the Roadmap above, a short issue describing
-  your approach before a large PR helps. Several of this project's own
-  decisions needed revisiting after a benchmark or test exposed a gap.
-  Easier to have that conversation before the code is written.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
-
-## Acknowledgments / References
-
-Architecture is informed by, not derived from, the following. Code is
-original throughout.
-
-- CMU 15-445/645, *Database Systems* (Andy Pavlo). Course structure and
-  BusTub's project sequence, used as an architectural reference only.
-- Hellerstein, Stonebraker & Hamilton, *Architecture of a Database
-  System*, Foundations and Trends in Databases (2007).
-- O'Neil, O'Neil & Weikum, "The LRU-K Page Replacement Algorithm For
-  Database Disk Buffering," SIGMOD 1993.
-- Pugh, "Skip Lists: A Probabilistic Alternative to Balanced Trees,"
-  Communications of the ACM (1990).
-- Mohan et al., "ARIES: A Transaction Recovery Method Supporting
-  Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead
-  Logging," ACM TODS (1992).
-- Berenson et al., "A Critique of ANSI SQL Isolation Levels," SIGMOD 1995.
-- Fekete et al., "Making Snapshot Isolation Serializable," ACM TODS (2005).
-- Cahill, Rohm & Fekete, "Serializable Isolation for Snapshot Databases,"
-  SIGMOD 2008.
-- [GoogleTest](https://github.com/google/googletest) and
-  [Google Benchmark](https://github.com/google/benchmark). Test and
-  benchmark infrastructure only, fetched via CMake `FetchContent`.
-- [SQLite](https://www.sqlite.org/). Linked test-only, as a
-  differential-testing oracle. Never shipped in the engine.
-
-## Contact
-
-- Email: [kavyasridhar2001@gmail.com](mailto:kavyasridhar2001@gmail.com)
-- GitHub: [@kavyasridhar1501](https://github.com/kavyasridhar1501)
+- Finer-grained locking in the disk engines.
+- Line/branch coverage reporting in CI.
+- Authentication, TLS, and rate-limiting for the HTTP API.
 
 ## Why I built this
 
 I wanted to understand how a database works below the SQL layer, not just
-use one. The best way to find out whether you understand something is to
-build it and see where it breaks.
+use one.
 
-- A head-to-head comparison, not just two implementations. Building a
-  B+-tree and an LSM-tree side by side, behind one interface, with the
-  same benchmark harness, shows when each one wins instead of asserting it
-  from a textbook.
-- Measurability over feature count. Several of the most interesting
-  findings weren't planned. They were bugs a benchmark or test surfaced
-  that a design review wouldn't have caught: a compaction thread starved
-  by a fast writer, a checkpoint mechanism that didn't actually bound
-  recovery time, a transaction-table mutex that undid the point of
-  fine-grained MVCC locking, an HTTP server race that only a real
-  concurrent test would hit. Each is written up in [DESIGN.md](DESIGN.md),
-  including the fix.
-- Saying no to scope, out loud. The SQL layer has no joins or aggregates.
-  The TPC-C/TPC-H benchmarks are labeled inspired by, not compliant with,
-  the official specs. Snapshot isolation is shown not preventing write
-  skew, because that's what the literature says, not a simpler story that
-  fits the demo better. A project that's honest about what it didn't
-  build is more useful than one that papers over the gaps.
+- **Head-to-head, not just two implementations.** Same benchmark harness
+  for the B+-tree and LSM-tree, so trade-offs show up as numbers, not
+  assertions.
+- **Measurability over feature count.** Several bugs were caught by a
+  benchmark or test, not a design review: a compaction thread starved by
+  a fast writer, a checkpoint that didn't actually bound recovery time, a
+  transaction-table mutex undoing MVCC's fine-grained locking, an HTTP
+  race only a concurrent test would hit. All written up in
+  [DESIGN.md](DESIGN.md).
+- **Honest about scope.** No joins or aggregates in the SQL layer.
+  TPC-C/TPC-H benchmarks are labeled inspired by, not compliant with, the
+  specs. Snapshot isolation is shown not preventing write skew, because
+  that's what the literature says.
 
-Full trade-off reasoning for every decision above is in
-[DESIGN.md](DESIGN.md).
+## Acknowledgments
+
+Architecture is informed by, not derived from, the following:
+
+- CMU 15-445/645, *Database Systems* (Andy Pavlo)
+- Hellerstein, Stonebraker & Hamilton, *Architecture of a Database System* (2007)
+- O'Neil, O'Neil & Weikum, "The LRU-K Page Replacement Algorithm For Database Disk Buffering," SIGMOD 1993
+- Pugh, "Skip Lists: A Probabilistic Alternative to Balanced Trees," CACM 1990
+- Mohan et al., "ARIES: A Transaction Recovery Method...," ACM TODS 1992
+- Berenson et al., "A Critique of ANSI SQL Isolation Levels," SIGMOD 1995
+- Fekete et al., "Making Snapshot Isolation Serializable," ACM TODS 2005
+- Cahill, Rohm & Fekete, "Serializable Isolation for Snapshot Databases," SIGMOD 2008
+
+## License
+
+MIT. See [LICENSE](LICENSE).
