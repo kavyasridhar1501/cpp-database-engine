@@ -37,6 +37,7 @@ add_executable(dbengine_tests
   sql/planner_test.cpp
   sql/catalog_test.cpp
   sql/database_test.cpp
+  http/http_server_test.cpp
 )
 
 target_include_directories(dbengine_tests

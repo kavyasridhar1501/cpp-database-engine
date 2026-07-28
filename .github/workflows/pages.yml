@@ -1,0 +1,46 @@
+# Publishes docs/index.html (a static, hand-written results page — no
+# build step, no generator) to GitHub Pages on every push to main.
+#
+# One-time manual step this workflow can't do for you: in the repo's
+# Settings -> Pages, set "Source" to "GitHub Actions". Until that's set,
+# this workflow will run but the deploy step will fail with a permissions
+# error — that's expected, not a bug in the workflow.
+name: Deploy results page to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

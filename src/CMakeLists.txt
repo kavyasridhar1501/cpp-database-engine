@@ -20,6 +20,7 @@ add_library(dbengine_core
   sql/planner.cpp
   sql/executor.cpp
   sql/database.cpp
+  http/http_server.cpp
 )
 
 target_include_directories(dbengine_core
@@ -38,6 +39,20 @@ target_include_directories(dbengine_cli
 )
 
 target_link_libraries(dbengine_cli
+  PRIVATE
+    dbengine_core
+)
+
+add_executable(dbengine_httpd
+  httpd_main.cpp
+)
+
+target_include_directories(dbengine_httpd
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(dbengine_httpd
   PRIVATE
     dbengine_core
 )
