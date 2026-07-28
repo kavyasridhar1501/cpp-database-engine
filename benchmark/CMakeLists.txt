@@ -6,6 +6,8 @@ add_executable(dbengine_bench
   wal_bench.cpp
   mvcc_bench.cpp
   sql_bench.cpp
+  tpcc_bench.cpp
+  tpch_bench.cpp
 )
 
 target_include_directories(dbengine_bench

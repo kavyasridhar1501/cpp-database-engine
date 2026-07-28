@@ -42,6 +42,7 @@ add_executable(dbengine_tests
 target_include_directories(dbengine_tests
   PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/test
 )
 
 target_link_libraries(dbengine_tests
@@ -49,6 +50,21 @@ target_link_libraries(dbengine_tests
     dbengine_core
     GTest::gtest_main
 )
+
+# SQLite differential testing (Phase 7) is test-only and needs a system
+# libsqlite3 (see CMakeLists.txt's find_package(SQLite3) call). Optional:
+# skip it gracefully rather than failing the whole test build when it's not
+# installed, rather than vendoring/FetchContent'ing a database library into
+# the project just for this.
+if(SQLite3_FOUND)
+  target_sources(dbengine_tests PRIVATE
+    validation/sqlite_reference.cpp
+    validation/sqlite_differential_test.cpp
+  )
+  target_link_libraries(dbengine_tests PRIVATE SQLite::SQLite3)
+else()
+  message(STATUS "SQLite3 not found — skipping the SQLite differential test suite (test/validation/)")
+endif()
 
 target_compile_definitions(dbengine_tests
   PRIVATE
