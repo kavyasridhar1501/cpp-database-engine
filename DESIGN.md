@@ -737,6 +737,100 @@ separate files is the same reasoning that keeps a WAL in its own
 `.wal`-suffixed file rather than interleaving log records into the data
 file's own page space.
 
+## Phase 7 — Validation: Differential Testing & TPC-Style Workloads
+
+**Linking a real SQLite for differential testing doesn't violate this
+project's "no external database libraries" rule, because that rule is
+about what ships in the engine, not what validates it.** The constraint
+(stated from the very first message of this project) exists so the B+-tree,
+LSM-tree, WAL/recovery, MVCC, and SQL layers are all this project's own
+work, not a wrapper around someone else's database. A test-only dependency
+that never links into `dbengine_core` or `dbengine_cli` — SQLite is pulled
+in via `find_package(SQLite3)` only inside `if(DBENGINE_BUILD_TESTS)`, and
+only `dbengine_tests` links `SQLite::SQLite3` (`test/CMakeLists.txt`) —
+plays the same role GoogleTest and Google Benchmark already do: a
+system/FetchContent tool that *checks* the engine, not a component *of* it.
+The Docker image (which builds with `-DDBENGINE_BUILD_TESTS=OFF`) has zero
+SQLite dependency, verified directly: `ldd` on the resulting `dbengine_cli`
+shows no `libsqlite3` linkage.
+
+**Differential testing needs no translation layer for the SQL *text*
+itself — this project's grammar (Phase 6) is a strict syntactic subset of
+real SQL — but does need one narrow semantic bridge: primary-key
+uniqueness.** `CREATE TABLE`/`INSERT`/`SELECT`/`DELETE` statements in this
+project's dialect parse identically in SQLite, so the exact same statement
+string can run against both and the results compared with no rewriting —
+*except* that this project's grammar treats column[0] as an implicit,
+always-enforced primary key (every `StorageEngine::Put` is an upsert),
+while bare `id INTEGER` in standard SQL is just a plain column with no
+uniqueness at all. The first version of this test suite sent identical
+text to both sides and found what looked like a serious bug: after a
+randomized insert/delete sequence, SQLite reported *far* more rows than
+this project's engine for the same key, e.g. three separate rows all with
+`id = 114` where the engine correctly held exactly one. That's not a bug —
+it's SQLite faithfully doing what was asked (insert three rows; nothing
+said `id` had to be unique), which is precisely why differential testing
+against a real, independently-implemented SQL engine is valuable: it
+surfaces exactly this kind of assumption a test author could otherwise
+bake into both sides of a comparison without noticing. The fix
+(`test/validation/sqlite_differential_test.cpp`) rewrites only the two
+statement kinds where it matters before sending them to SQLite —
+`CREATE TABLE`'s first `INTEGER` becomes `INTEGER PRIMARY KEY`, and
+`INSERT` becomes `INSERT OR REPLACE` — so SQLite enforces the same
+one-row-per-key invariant this project's storage layer always has. Every
+other statement (`SELECT`, `DELETE`, and the untouched remainder of
+`CREATE TABLE`/`INSERT`) is sent completely unmodified.
+
+**The randomized differential test deliberately avoids two of this
+project's own documented scope limits rather than treating them as bugs
+when SQLite "disagrees."** Generated primary keys stay non-negative
+(this project rejects negative keys — see Phase 6's key-encoding scheme;
+SQLite has no such restriction) and generated `TEXT` payloads stay well
+under `MAX_VALUE_SIZE`. Both are already covered directly by
+`DatabaseTest.ThrowsOnNegativePrimaryKey` and
+`ThrowsOnRowTooLargeForMaxValueSize` (Phase 6) — the differential suite's
+job is comparing *behavior within the SQL subset both sides actually
+support*, not re-litigating scope decisions Phase 6 already made and
+documented.
+
+**"TPC-C-style" and "TPC-H-style" here mean *inspired by*, not
+*compliant with*, the official specifications — worth being explicit about
+given how easy it is for a benchmark name to imply more rigor than it
+delivers.** The real TPC-C benchmark specifies five transaction types
+(New-Order, Payment, Order-Status, Delivery, Stock-Level) with a fixed
+mix, strict response-time percentiles, ACID compliance requirements, and
+audited data-scaling rules; TPC-H specifies 22 read-only analytical
+queries, most involving multi-table joins, `GROUP BY`, and aggregates,
+over a specific scale-factor schema. This project's SQL layer supports
+none of `UPDATE`, joins, `GROUP BY`, or aggregates (Phase 6's deliberate
+scope cuts), so literal compliance with either spec is not achievable
+without building substantially more of a SQL engine — out of scope for a
+validation phase. What's implemented instead:
+
+- **TPC-C-*inspired*** (`benchmark/tpcc_bench.cpp`): a `warehouse`/
+  `customer`/`stock`/`orders`/`order_line` schema with TPC-C's composite
+  `(warehouse_id, local_id)` keys flattened into single `INTEGER` primary
+  keys by arithmetic (`w_id * customers_per_warehouse + local_id`, the
+  standard workaround on any engine without composite-key support — see
+  Phase 6's key-encoding section for why this project's keys are single
+  columns to begin with), and a simplified New-Order transaction: look up
+  the placing customer, then for each of 10 order lines look up and
+  decrement the relevant stock row (an upsert-as-update, this project's
+  storage model) and insert an order-line row, finishing with one orders
+  row insert. Not wrapped in an actual multi-statement transaction — the
+  SQL layer doesn't expose `Begin`/`Commit` yet (see Deferred, below) —
+  so what this measures is the SQL layer's raw statement throughput under
+  a TPC-C-*shaped* multi-table access pattern, not transactional cost.
+- **TPC-H-*inspired*** (`benchmark/tpch_bench.cpp`): a single large
+  `lineitem`-like fact table (300,000 rows) and a Q1-style filter
+  (`WHERE l_shipdate <= X`) swept across selectivity levels. `l_shipdate`
+  is deliberately scattered relative to the primary key via a multiplier
+  coprime with its value range, so no insertion-order trick lets the
+  planner do better than a genuine `FULL_SCAN` — the honest worst case
+  this benchmark characterizes, and arguably TPC-H's actual defining
+  access pattern (a large, non-indexed analytical filter) even without the
+  join and `GROUP BY` that would follow it in the real query.
+
 ## Deferred to later phases
 
 - Free-page reuse in `BPlusTree`'s on-disk page ids specifically (SSTables
@@ -790,4 +884,14 @@ file's own page space.
   SQL front-end) — Phases 4 and 5 built both underlying mechanisms; wiring
   either into the SQL layer is a natural but nontrivial follow-up this
   phase deliberately left for later so it could focus on parsing and
-  planning.
+  planning. Phase 7's TPC-C-inspired benchmark runs each New-Order
+  "transaction" as a sequence of independently-committed statements for
+  exactly this reason.
+- Literal TPC-C/TPC-H compliance (the full five-transaction TPC-C mix with
+  audited response-time percentiles; TPC-H's join- and
+  `GROUP BY`-dependent query set) — see the Phase 7 section above for
+  exactly what stands in the way (no `UPDATE`, joins, or aggregates) and
+  what was built instead.
+- Joins, `GROUP BY`, and aggregate functions in the SQL layer generally —
+  the single largest gap between this project's grammar and being able to
+  run real TPC-H, called out specifically in the Phase 7 section above.

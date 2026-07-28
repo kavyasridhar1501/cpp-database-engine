@@ -11,7 +11,7 @@ Built in phases, each with its own tests and benchmark numbers — see
 [DESIGN.md](DESIGN.md) for trade-off notes and [BENCHMARKS.md](BENCHMARKS.md)
 for results.
 
-## Status: Phase 6 — SQL Front-End & Tiny Optimizer
+## Status: Phase 7 — Validation & Writeup
 
 - `DiskManager` (`src/storage/disk/`): page-granular (4096-byte, fixed at
   compile time) reads/writes over a single heap file via `pread`/`pwrite`.
@@ -59,29 +59,38 @@ for results.
   real cost-based optimizer does that this one doesn't.
 - A minimal CLI shell (`alloc` / `write` / `read` / `stats` / `sql`) for
   poking raw pages by hand or running one SQL statement at a time.
-- GoogleTest suite (182 tests): DiskManager, replacer, BufferPoolManager,
-  B+-tree, LSM-tree, WAL/recovery, MVCC, and SQL correctness, including
-  randomized oracle tests for each storage engine and for the SQL layer
-  (run against both `BTREE`- and `LSM`-backed tables); a `LogManager` test
-  suite; a `WALBPlusTreeEngine` suite covering transactions, live
-  abort/undo, checkpointing, and simulated-crash recovery; a
-  **crash-injection harness** that forks a real worker process, `SIGKILL`s
-  it at a random point, and verifies recovered state against an
+- **Differential testing against a real SQLite** (`test/validation/`,
+  test-only — see DESIGN.md for why this doesn't compromise the "no
+  external database libraries" rule the engine itself follows): identical
+  SQL statement text run against both this project's `Database` and a real
+  SQLite, results compared directly, including a 2,000-operation randomized
+  fuzzer, run against both `BTREE`- and `LSM`-backed tables.
+- GoogleTest suite (192 tests): DiskManager, replacer, BufferPoolManager,
+  B+-tree, LSM-tree, WAL/recovery, MVCC, SQL, and SQLite-differential
+  correctness, including randomized oracle tests for each storage engine
+  and for the SQL layer (run against both `BTREE`- and `LSM`-backed
+  tables); a `LogManager` test suite; a `WALBPlusTreeEngine` suite covering
+  transactions, live abort/undo, checkpointing, and simulated-crash
+  recovery; a **crash-injection harness** that forks a real worker process,
+  `SIGKILL`s it at a random point, and verifies recovered state against an
   independent oracle — 150 cycles against the B+-tree, 100 against the
   LSM-tree, every push; an `MVCCStore` suite demonstrating dirty read,
   non-repeatable read, and write skew each appearing and then vanishing
   under the appropriate isolation level, plus a real multi-threaded
-  no-lost-updates stress test and GC correctness tests; and a SQL suite
+  no-lost-updates stress test and GC correctness tests; a SQL suite
   covering the lexer, parser, planner's access-path selection, row
-  encoding, and end-to-end query execution.
+  encoding, and end-to-end query execution; and the SQLite differential
+  suite above.
 - Google Benchmark suites: disk I/O; a Zipfian LRU-K-vs-LRU hit-rate curve;
   B+-tree point-lookup/range-scan/insert-throughput at 1M/10M keys; a
   head-to-head B+-tree-vs-LSM-tree comparison across write-heavy to
   read-heavy workloads; WAL recovery-time-vs-log-size (with and without
   checkpointing) plus WAL-on-vs-off throughput cost; MVCC throughput
-  scaling from 1 to 4 threads against a coarse-lock baseline; and a SQL
+  scaling from 1 to 4 threads against a coarse-lock baseline; a SQL
   benchmark comparing indexed vs. unindexed access paths for the same
-  logical query at 1K/10K/100K rows.
+  logical query at 1K/10K/100K rows; and TPC-C-/TPC-H-*inspired* (not
+  compliant — see DESIGN.md) multi-table OLTP and large-table analytical
+  scan workloads.
 - GitHub Actions CI (build + test + CLI smoke test + Docker build) on every
   push.
 - Docker image that builds the engine and runs the CLI.
@@ -90,7 +99,12 @@ for results.
 
 Requires CMake >= 3.16 and a C++20 compiler (GCC 12+ / Clang 15+). GoogleTest
 and Google Benchmark are fetched automatically via `FetchContent` — no
-external DB libraries are used anywhere in this project.
+external DB libraries are used anywhere in the *engine itself*. The one
+exception, test-only: the Phase 7 differential test suite links a system
+SQLite3 (`libsqlite3-dev` on Debian/Ubuntu) purely as a validation oracle —
+see DESIGN.md for why that doesn't compromise the engine's own "no external
+database libraries" rule. It's optional: if `find_package(SQLite3)` doesn't
+find one, that one test file is skipped and everything else still builds.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -145,6 +159,6 @@ docker run --rm -it -v dbengine-data:/home/dbengine/data dbengine
 3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters)
 4. Write-ahead log & ARIES-style crash recovery
 5. MVCC concurrency (snapshot isolation)
-6. SQL front-end & tiny optimizer *(current)*
-7. Validation against SQLite, TPC-C/H-style workload
+6. SQL front-end & tiny optimizer
+7. Validation against SQLite, TPC-C/H-style workload *(current)*
 8. Deployment (GHCR image, results page, optional read-only HTTP API)

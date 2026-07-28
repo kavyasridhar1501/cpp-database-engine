@@ -493,3 +493,68 @@ between each pair is which access path the planner chose. Swept across
   touches one row while `FULL_SCAN` touches every row in the table. The
   fixed ~100-row scan cost both paths share shrinks the *relative*
   advantage of indexing without changing its direction.
+
+## Phase 7 — Validation: Differential Testing & TPC-Style Workloads
+
+**What's measured:** (1) a TPC-C-*inspired* mixed OLTP transaction
+(`benchmark/tpcc_bench.cpp`) — 1 customer lookup + 10× (1 stock lookup + 1
+stock update + 1 order-line insert) + 1 order insert, 13 SQL statements
+per "transaction" — against a 4-warehouse / 1,000-customers-per-warehouse
+/ 10,000-items-per-warehouse dataset, `BTREE`- and `LSM`-backed; (2) a
+TPC-H-*inspired* Q1-style filter (`benchmark/tpch_bench.cpp`) — `SELECT
+l_extendedprice FROM lineitem WHERE l_shipdate <= X` — against a 300,000-row
+single-table fact table, swept across selectivity (10% / 50% / 90% of rows
+matching). Neither is compliant with the official TPC-C/TPC-H
+specifications; see DESIGN.md's Phase 7 section for exactly what that would
+require and why this project's SQL layer can't do it yet (no `UPDATE`,
+joins, or aggregates).
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='TPCC'
+./build/benchmark/dbengine_bench --benchmark_filter='TPCH'
+```
+
+**Results** (4-core sandbox, same caveats as earlier phases):
+
+| Engine | Time/transaction | Transactions/sec |
+|---|---:|---:|
+| B+-tree | 90.9 µs | 11,003/s |
+| LSM-tree | 66.4 µs | 15,287/s |
+
+| Selectivity | Matched rows (of 300,000) | Query time |
+|---:|---:|---:|
+| 10% | 30,300 | 55.0 ms |
+| 50% | 150,300 | 69.2 ms |
+| 90% | 270,300 | 80.8 ms |
+
+**Takeaways:**
+- **LSM beats B+-tree on the New-Order-style transaction (15,287/s vs.
+  11,003/s, ~1.4x), consistent with Phase 3's head-to-head finding that
+  LSM wins write-heavy workloads.** This transaction is write-dominated —
+  11 of its 13 statements are writes (10 stock/order-line inserts plus 1
+  order insert, against only 2 reads) — exactly the shape Phase 3's
+  benchmark already showed favors the LSM-tree's append-only write path
+  over the B+-tree's in-place page updates. Phase 7 doesn't need a new
+  explanation for this result; it's the same trade-off from Phase 3
+  showing up again through a different, more realistic access pattern.
+- **The TPC-H-style scan's cost grows far more slowly than its result size
+  does: a 9x increase in matched rows (30,300 → 270,300) costs only ~1.5x
+  more time (55.0ms → 80.8ms).** This is the expected, and arguably
+  defining, behavior of a full-table scan with no usable index: cost
+  tracks *table size* (fixed at 300,000 rows here), not *result size*.
+  The small residual growth with selectivity is the extra
+  per-matched-row work (decoding the row, building it into the result
+  set) layered on top of an otherwise-constant per-row scan cost that
+  every one of the 300,000 rows pays regardless of whether it matches.
+  This is the concrete cost a real secondary index (or, for TPC-H
+  specifically, a materialized aggregate) exists to avoid — see DESIGN.md's
+  Deferred list for both.
+- **Together with Phase 6's benchmark, these two results characterize the
+  planner's access-path choice completely for this project's grammar:**
+  Phase 6 showed indexed access paths (`POINT_LOOKUP`/`RANGE_SCAN`) cost
+  is independent of table size and orders of magnitude cheaper than
+  `FULL_SCAN` at the same table size; this phase shows that *within*
+  `FULL_SCAN`, cost is independent of result size and dependent only on
+  table size. Every query this SQL layer can run falls into one of those
+  two regimes.

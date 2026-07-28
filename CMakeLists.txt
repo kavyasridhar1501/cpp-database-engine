@@ -29,6 +29,15 @@ if(DBENGINE_BUILD_TESTS)
   set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
 
+  # Test-only, and only for the SQLite differential test suite (Phase 7):
+  # a *system* library, not vendored/FetchContent'd, and never linked into
+  # dbengine_core/dbengine_cli — the "no external database libraries"
+  # constraint is about what ships in the engine, not what validates it
+  # against a real, mature implementation in tests. See DESIGN.md's Phase 7
+  # section. Optional: if it's not installed, that one test file is simply
+  # skipped (test/CMakeLists.txt) rather than failing the whole build.
+  find_package(SQLite3)
+
   add_subdirectory(test)
 endif()
 
