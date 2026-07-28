@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cpp-database-engine — results</title>
+<meta name="description" content="A disk-backed database engine built from scratch in C++20: B+-tree vs. LSM-tree, ARIES recovery, MVCC, a tiny SQL optimizer, and the benchmark numbers behind each design decision.">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --bg-alt: #f6f7f9;
+    --fg: #1a1d23;
+    --fg-muted: #5b6270;
+    --border: #e2e5ea;
+    --accent: #2f6fed;
+    --accent-bg: #eef3fe;
+    --code-bg: #f0f1f4;
+    --good: #1a7f4f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --bg-alt: #1b1e24;
+      --fg: #e7e9ee;
+      --fg-muted: #9aa1ad;
+      --border: #2b2f38;
+      --accent: #6d9bff;
+      --accent-bg: #1c2740;
+      --code-bg: #1e2128;
+      --good: #4fd68f;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 3rem 1.5rem 5rem; }
+  header { margin-bottom: 2.5rem; }
+  h1 {
+    font-size: 1.9rem;
+    margin: 0 0 0.4rem;
+    letter-spacing: -0.01em;
+  }
+  .tagline { color: var(--fg-muted); font-size: 1.05rem; margin: 0 0 1.2rem; max-width: 60ch; }
+  .badges { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.5rem; }
+  .badge {
+    display: inline-block;
+    font-size: 0.8rem;
+    padding: 0.25rem 0.6rem;
+    border-radius: 999px;
+    background: var(--accent-bg);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    font-weight: 600;
+  }
+  .links { margin-top: 1rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+  .links a {
+    color: var(--accent);
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+  .links a:hover { text-decoration: underline; }
+  h2 {
+    font-size: 1.25rem;
+    margin: 2.8rem 0 0.9rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 0.6rem; color: var(--fg); }
+  p { margin: 0.6rem 0; }
+  .lede { color: var(--fg-muted); font-size: 0.95rem; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em;
+  }
+  code { background: var(--code-bg); padding: 0.1em 0.4em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg);
+    padding: 0.9rem 1rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+  }
+  pre code { background: none; padding: 0; }
+  .phases { list-style: none; padding: 0; margin: 0; }
+  .phases li {
+    display: grid;
+    grid-template-columns: 2.2rem 1fr;
+    gap: 0.6rem;
+    padding: 0.55rem 0;
+    border-bottom: 1px dashed var(--border);
+    font-size: 0.95rem;
+  }
+  .phases li:last-child { border-bottom: none; }
+  .phase-num {
+    color: var(--accent);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .table-scroll { overflow-x: auto; margin: 0.8rem 0 1.2rem; border: 1px solid var(--border); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; min-width: 420px; }
+  th, td { text-align: right; padding: 0.5rem 0.9rem; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    background: var(--bg-alt);
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+  }
+  tbody tr:not(:last-child) td { border-bottom: 1px solid var(--border); }
+  .finding {
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    padding: 0.8rem 1rem;
+    margin: 0.8rem 0;
+    font-size: 0.92rem;
+  }
+  .finding strong { color: var(--fg); }
+  .caveat {
+    font-size: 0.82rem;
+    color: var(--fg-muted);
+    margin-top: -0.3rem;
+  }
+  footer {
+    margin-top: 3.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-size: 0.85rem;
+  }
+  footer a { color: var(--fg-muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="badges">
+    <span class="badge">C++20</span>
+    <span class="badge">from scratch</span>
+    <span class="badge">8/8 phases complete</span>
+  </div>
+  <h1>cpp-database-engine</h1>
+  <p class="tagline">
+    A disk-backed database engine built from scratch: a head-to-head
+    comparison of a B+-tree and an LSM-tree behind one storage interface,
+    ARIES-style crash recovery, MVCC snapshot isolation, and a small SQL
+    front-end with a real access-path optimizer — each claim backed by a
+    reproducible benchmark, not just a design doc.
+  </p>
+  <div class="links">
+    <a href="https://github.com/kavyasridhar1501/cpp-database-engine">Repository →</a>
+    <a href="https://github.com/kavyasridhar1501/cpp-database-engine/blob/main/DESIGN.md">Design notes →</a>
+    <a href="https://github.com/kavyasridhar1501/cpp-database-engine/blob/main/BENCHMARKS.md">Full benchmark log →</a>
+  </div>
+</header>
+
+<section>
+  <h2>What's built</h2>
+  <p class="lede">Architecture informed by CMU 15-445 and Hellerstein/Stonebraker/Hamilton's
+    <em>Architecture of a Database System</em> — the code itself is original, not derived from BusTub.</p>
+  <ol class="phases">
+    <li><span class="phase-num">00</span><span>Disk manager, buffer pool scaffolding, CI &amp; Docker from day one</span></li>
+    <li><span class="phase-num">01</span><span>Buffer pool manager — LRU-K eviction, beats plain LRU on a Zipfian trace at every pool size</span></li>
+    <li><span class="phase-num">02</span><span>Engine A: a disk-backed B+-tree — page-overlaid nodes, splits/merges, range scans</span></li>
+    <li><span class="phase-num">03</span><span>Engine B: an LSM-tree — skip-list memtable, Bloom-filtered SSTables, size-tiered compaction</span></li>
+    <li><span class="phase-num">04</span><span>Write-ahead log &amp; ARIES-style crash recovery, proven with a real <code>fork()</code>/<code>SIGKILL</code> harness</span></li>
+    <li><span class="phase-num">05</span><span>MVCC concurrency — four isolation levels, dirty read/non-repeatable read/write skew made to appear and vanish on demand</span></li>
+    <li><span class="phase-num">06</span><span>A tiny SQL front-end — lexer, parser, and a planner that actually picks access paths</span></li>
+    <li><span class="phase-num">07</span><span>Validation — differential testing against real SQLite, TPC-C/H-inspired workloads</span></li>
+    <li><span class="phase-num">08</span><span>Deployment — this page, a published container image, and a read-only HTTP API</span></li>
+  </ol>
+</section>
+
+<section>
+  <h2>B+-tree vs. LSM-tree: no crossover in throughput, a clear one in read amplification</h2>
+  <p class="lede">100,000 keys, Zipfian-skewed mixed read/write workload, swept from 5% to 90% writes.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Write %</th><th>B+-tree ops/s</th><th>LSM ops/s</th><th>B+-tree reads/op</th><th>LSM reads/op</th></tr></thead>
+      <tbody>
+        <tr><td>5%</td><td>541k</td><td>1.19M</td><td>0.106</td><td>0.401</td></tr>
+        <tr><td>30%</td><td>560k</td><td>1.50M</td><td>0.106</td><td>0.263</td></tr>
+        <tr><td>50%</td><td>550k</td><td>1.58M</td><td>0.106</td><td>0.198</td></tr>
+        <tr><td>70%</td><td>550k</td><td>1.85M</td><td>0.106</td><td>0.119</td></tr>
+        <tr><td>90%</td><td>530k</td><td>1.97M</td><td>0.106</td><td>0.042</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="finding">
+    <strong>The LSM-tree wins outright on throughput at every write fraction tested</strong> — no
+    crossover in this range. But read amplification tells the textbook story instead: the
+    B+-tree's disk-reads-per-op is flat (~0.106, one tree descent regardless of workload);
+    the LSM-tree's falls from 0.401 to 0.042 as writes increase, crossing the B+-tree's line
+    around 75–85% writes. Cheap writes, workload-dependent reads — made directly measurable.
+  </div>
+</section>
+
+<section>
+  <h2>ARIES recovery: checkpoints only help if recovery can find them cheaply</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Log size (ops)</th><th>Recovery, no checkpoint</th><th>Recovery, checkpoint every 100 txns</th></tr></thead>
+      <tbody>
+        <tr><td>1,000</td><td>0.44 ms</td><td>0.016 ms</td></tr>
+        <tr><td>5,000</td><td>1.93 ms</td><td>0.015 ms</td></tr>
+        <tr><td>10,000</td><td>3.96 ms</td><td>0.016 ms</td></tr>
+        <tr><td>50,000</td><td>22.2 ms</td><td>—</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="finding">
+    <strong>Without checkpointing, recovery time scales linearly with log size — with it, recovery
+    stays flat regardless of log size.</strong> Getting the flat line required fixing a real bug:
+    the first implementation replayed only the log since the last checkpoint, but still
+    <em>located</em> that checkpoint with a full scan from the start, silently defeating the
+    point of checkpointing. This benchmark caught it directly.
+  </div>
+</section>
+
+<section>
+  <h2>MVCC: fine-grained locking holds up under contention; a global lock collapses</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Threads</th><th>MVCC ops/s</th><th>Coarse-lock ops/s</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>375k</td><td>23.8M</td></tr>
+        <tr><td>2</td><td>572k</td><td>3.20M</td></tr>
+        <tr><td>4</td><td>554k</td><td>1.39M</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="finding">
+    <strong>MVCC throughput holds roughly flat from 1 to 4 threads; a single-mutex baseline
+    collapses ~17×</strong> over the same range. Also required a real fix: the transaction table
+    itself was one global mutex, undermining the per-key locking beneath it — sharding it
+    16 ways (same technique already used for buffer-pool frames and LSM tier locks) is what
+    produced the flat line.
+  </div>
+</section>
+
+<section>
+  <h2>The tiny SQL optimizer: picking the right access path is worth orders of magnitude</h2>
+  <p class="lede">The exact same logical query, issued on an indexed column vs. an unindexed one holding identical values.</p>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Rows</th><th>Point, indexed</th><th>Point, unindexed</th><th>Slowdown</th></tr></thead>
+      <tbody>
+        <tr><td>1,000</td><td>1.12 µs</td><td>51.7 µs</td><td>46×</td></tr>
+        <tr><td>10,000</td><td>2.13 µs</td><td>869 µs</td><td>408×</td></tr>
+        <tr><td>100,000</td><td>3.86 µs</td><td>14,444 µs</td><td>3,742×</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="finding">
+    <strong>At 100,000 rows, choosing the right access path is a ~3,700× difference for a point
+    query</strong> — and the gap is still widening with table size, not leveling off. The indexed
+    path costs one B+-tree descent regardless of table size; the unindexed one is a full
+    table scan every time. This is what the planner (<code>src/sql/planner.cpp</code>) exists to avoid.
+  </div>
+</section>
+
+<section>
+  <h2>TPC-style validation: the LSM write advantage holds under a realistic mix; scan cost tracks table size, not selectivity</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Engine</th><th>Time/txn</th><th>Txns/sec</th></tr></thead>
+      <tbody>
+        <tr><td>B+-tree</td><td>90.9 µs</td><td>11,003/s</td></tr>
+        <tr><td>LSM-tree</td><td>66.4 µs</td><td>15,287/s</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>Selectivity</th><th>Matched rows (of 300,000)</th><th>Query time</th></tr></thead>
+      <tbody>
+        <tr><td>10%</td><td>30,300</td><td>55.0 ms</td></tr>
+        <tr><td>50%</td><td>150,300</td><td>69.2 ms</td></tr>
+        <tr><td>90%</td><td>270,300</td><td>80.8 ms</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="finding">
+    A TPC-C-<em>inspired</em> New-Order transaction (11 of 13 statements are writes) favors the
+    LSM-tree by ~1.4×, consistent with the head-to-head result above. A TPC-H-<em>inspired</em>
+    full-table filter shows cost tracking table size, not result size: a 9× increase in
+    matched rows costs only ~1.5× more time. (Neither claims compliance with the official
+    TPC-C/TPC-H specs — see <a href="https://github.com/kavyasridhar1501/cpp-database-engine/blob/main/DESIGN.md">DESIGN.md</a> for exactly why.)
+  </div>
+</section>
+
+<section>
+  <h2>Try it</h2>
+  <h3>Pull the published image</h3>
+  <pre><code>docker pull ghcr.io/kavyasridhar1501/cpp-database-engine:latest
+docker run --rm -it ghcr.io/kavyasridhar1501/cpp-database-engine:latest</code></pre>
+  <h3>Or build from source</h3>
+  <pre><code>git clone https://github.com/kavyasridhar1501/cpp-database-engine.git
+cd cpp-database-engine
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure</code></pre>
+  <p class="caveat">All numbers on this page are from a 4-core containerized sandbox, recorded for
+    trend-tracking across phases — not a hardware performance claim. Reproduction commands
+    and full context for every result are in
+    <a href="https://github.com/kavyasridhar1501/cpp-database-engine/blob/main/BENCHMARKS.md">BENCHMARKS.md</a>.</p>
+</section>
+
+<footer>
+  <p>Source: <a href="https://github.com/kavyasridhar1501/cpp-database-engine">github.com/kavyasridhar1501/cpp-database-engine</a> ·
+     Built in 8 phases, each with its own tests and benchmark numbers.</p>
+</footer>
+
+</div>
+</body>
+</html>

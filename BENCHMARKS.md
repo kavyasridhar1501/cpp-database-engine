@@ -558,3 +558,23 @@ joins, or aggregates).
   `FULL_SCAN`, cost is independent of result size and dependent only on
   table size. Every query this SQL layer can run falls into one of those
   two regimes.
+
+## Phase 8 — Deployment
+
+No new benchmark for this phase — it's about making the existing engine
+and its Phase 0-7 results reachable (a published container image, this
+document's headline numbers reflected on a GitHub Pages results page, a
+read-only HTTP front-end over the SQL layer), not adding new
+storage-engine behavior to measure. See DESIGN.md's Phase 8 section for
+what was built and the race condition (`HttpServer::Run()` racing
+`Stop()`) that its test suite — not manual testing — caught.
+
+This closes out the project's 8-phase plan: a disk-backed B+-tree and
+LSM-tree behind one `StorageEngine` interface (Phases 2-3), ARIES-style
+crash recovery proven against real `kill -9`s (Phase 4), MVCC snapshot
+isolation with the anomalies it does and doesn't prevent made concretely
+visible (Phase 5), a SQL front-end with a real (if tiny) cost-based
+optimizer (Phase 6), correctness validated against an independent
+implementation and workloads inspired by industry-standard benchmarks
+(Phase 7), and now a way to actually reach any of it without cloning the
+repository and building from source (Phase 8).

@@ -831,6 +831,108 @@ validation phase. What's implemented instead:
   access pattern (a large, non-indexed analytical filter) even without the
   join and `GROUP BY` that would follow it in the real query.
 
+## Phase 8 — Deployment
+
+**Three deliverables, each a thin layer over work already done, deliberately —
+this phase isn't supposed to add new storage-engine ideas, only make
+what exists reachable.** A GHCR image (`.github/workflows/publish.yml`)
+builds the same `Dockerfile` the CI workflow already validates on every
+push and publishes it to `ghcr.io/<owner>/<repo>` using the repository's
+automatic `GITHUB_TOKEN` — no new build logic, no separate registry
+credentials to manage. A static results page (`docs/index.html`, deployed
+via `.github/workflows/pages.yml`) is hand-written HTML/CSS transcribing
+BENCHMARKS.md's headline numbers — no generator, no client-side JS, no
+external CDN, consistent with this project's "no external dependencies"
+ethos extended into its own docs site. And a read-only HTTP API
+(`src/http/`) is a thin network front-end over `Database::Execute`,
+restricted to `SELECT` by construction (see below), reusing the parser,
+planner, and executor from Phase 6 completely unchanged.
+
+**The read-only HTTP API is built on raw POSIX sockets, not an external
+web framework, for the same reason the SQL layer has its own lexer
+instead of a parser-generator library: this project's constraint is "no
+external libraries in the engine," and a demo-scale HTTP server (two
+routes, GET-only, no keep-alive) is well within what's reasonable to
+build directly.** `HttpServer` parses just enough of an HTTP/1.1 request
+(the request line and enough of the headers to find the blank-line
+terminator) to route `GET /health` and `GET /query?sql=...`, and responds
+with a small hand-written JSON serializer for `QueryResult` — no
+`nlohmann/json`, no `cpp-httplib`. This mirrors the same trade-off made
+for SQLite in Phase 7 in the opposite direction: SQLite was worth linking
+because differential testing specifically needs an independent, mature
+implementation to compare against; a JSON serializer or HTTP parser needs
+no such independence, so writing the (much smaller) minimal version that
+covers this project's exact two routes is the more consistent choice.
+
+**Read-only is enforced by parsing every request twice: once by
+`HttpServer` to check the statement's type, and again by
+`Database::Execute` to actually run it.** `HandleConnection` calls
+`Parser::Parse(sql)` itself and rejects anything that isn't a
+`SelectStmt` with a 400 *before* ever calling `db_->Execute()` — so a
+`DELETE`/`INSERT`/`CREATE TABLE` sent to `/query` never reaches the
+engine at all, not even to fail partway through. The obvious optimization
+(parse once, pass the already-built `Statement` to a lower-level execute
+call) isn't available without changing `Database`'s public API, and a
+double parse costs microseconds against network I/O that costs
+milliseconds — not worth it here.
+
+**Single-threaded, one connection at a time, by design — not a
+"come back to this" gap.** `Run()`'s accept loop fully handles one
+connection (read request, execute, write response, close) before polling
+for the next. `Database` was never designed for concurrent access from
+multiple threads (no locking anywhere in `Catalog`, `EncodeRow`/`DecodeRow`,
+or the executor), and none of the underlying `StorageEngine`s expose a
+concurrency contract for arbitrary multi-threaded `Get`/`Scan` either
+(`MVCCStore`, Phase 5's answer to exactly this problem, is a separate,
+in-memory-only component that the SQL layer doesn't sit on top of — see
+Phase 6's section on why). Serving one request at a time sidesteps all of
+that entirely, at the honest cost of only ever running one query
+concurrently — an acceptable trade for a demo API, not a claim that this
+is how a production read replica should be built.
+
+**Catalog non-persistence (documented in Phase 6) becomes directly visible
+here, and is solved with a startup-only mechanism that keeps the network
+API's read-only property intact.** Since `Database`'s catalog is
+in-memory and rebuilt empty on every construction, a fresh
+`dbengine_httpd` process has no way to know a table exists — even when
+the row bytes a separate CLI session wrote are still sitting on disk at
+the path it opened. `dbengine_httpd` takes an optional third argument, a
+path to a file of setup statements (typically `CREATE TABLE` and
+`INSERT`), run once via `Database::Execute` *before* the HTTP listener
+starts accepting connections. This is not a backdoor around "read-only
+over the network": nothing in it runs in response to a request, and it's
+driven entirely by a local file the operator controls at process startup,
+the same trust boundary as passing a config file to any server. Discovered
+by testing the deployed shape end-to-end rather than just the unit-level
+API — a fresh `dbengine_httpd` pointed at a file a CLI session had already
+populated returned `"no such table"` for every query until this was added,
+which is exactly the kind of gap a phase built around "run all these
+pieces together for real" is supposed to surface.
+
+**A genuine concurrency bug was found and fixed while writing this
+phase's tests, not the engine's core logic: `HttpServer::Run()`
+unconditionally set its running-flag to `true` as its first statement,
+racing against `Stop()` if the two ever happened out of order.** The
+intended lifecycle is: construct `HttpServer`, spawn a thread running
+`Run()`, and later call `Stop()` from another thread to end it. If
+`Stop()` executed *before* the spawned thread was actually scheduled to
+begin `Run()` — entirely possible, and increasingly likely the less other
+work a test does between spawning the thread and calling `Stop()` — the
+old code would have `Run()` silently overwrite `running_` back to `true`
+after `Stop()` had already set it `false`, and the accept loop would
+never exit. This didn't show up in ad hoc manual testing (starting the
+server, `curl`-ing it, then sending `SIGTERM` always left enough real
+wall-clock time between start and stop for the race window to close), but
+showed up reliably once `test/http/http_server_test.cpp` exercised the
+same start/stop lifecycle with no artificial delay — closer to how a test
+*should* exercise a start/stop API, and exactly the kind of timing-
+dependent bug that only a real concurrent test (not a single-threaded
+unit test, and not manual testing with human-scale delays) will catch.
+The fix: `running_` starts `true` as the member's default initializer and
+`Run()` never writes `true` to it again — `Stop()` is now a one-way
+`true`→`false` transition with no window in which `Run()`'s own startup
+code can race it, regardless of scheduling order between the two threads.
+
 ## Deferred to later phases
 
 - Free-page reuse in `BPlusTree`'s on-disk page ids specifically (SSTables
@@ -895,3 +997,16 @@ validation phase. What's implemented instead:
 - Joins, `GROUP BY`, and aggregate functions in the SQL layer generally —
   the single largest gap between this project's grammar and being able to
   run real TPC-H, called out specifically in the Phase 7 section above.
+- Multi-threaded request handling for `HttpServer` — deliberately
+  single-connection-at-a-time for now (see the Phase 8 section above for
+  why); would need `Database`/`Catalog` to grow real concurrency support
+  first, not just a bigger thread pool in the server.
+- Persisted catalog for `dbengine_httpd`'s benefit specifically — the
+  schema-file startup mechanism (Phase 8) is a workaround for the same gap
+  Phase 6 already documented, not a fix for it; a real fix (see Phase 6's
+  Deferred entry above) would make the startup file unnecessary.
+- HTTPS/TLS, authentication, and rate-limiting for the HTTP API — it's an
+  explicitly *demo-scale* read-only API over plain HTTP, not hardened for
+  exposure beyond a trusted network; a resource-exhaustion query (an
+  unbounded `FULL_SCAN` against a large table) is one `curl` away from
+  anyone who can reach it.
