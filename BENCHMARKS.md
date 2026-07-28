@@ -365,3 +365,72 @@ not part of what's timed.)*
   standard mitigation (not implemented here; see DESIGN.md) is group
   commit: batching multiple transactions' commits into a single fsync so
   concurrent commits share the cost instead of each paying for their own.
+
+## Phase 5 — MVCC Concurrency
+
+**What's measured:** throughput (autocommit ops/sec) of `MVCCStore` under an
+80% read / 20% write point-workload over 10,000 keys, swept across 1, 2, and
+4 threads (this sandbox's full `nproc`), each thread running its own
+autocommit `SNAPSHOT` transaction per operation. Compared against a
+baseline with identical workload shape and key range, but backed by a plain
+`std::unordered_map` behind a single `std::mutex` held for the whole
+operation — the "obvious" alternative to MVCC for making a shared table
+thread-safe, and what makes MVCC's scaling story legible rather than just a
+number in isolation.
+
+**Reproduce:**
+```sh
+./build/benchmark/dbengine_bench --benchmark_filter='MVCCFixture' \
+    --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
+```
+
+**Results** (4-core sandbox; `real_time` mode so wall-clock reflects actual
+parallelism, `cv` up to ~20% at 2 threads — the sandbox's scheduler noise,
+consistent with earlier phases' caveats about shared-CPU environments):
+
+| Threads | MVCC ops/sec | Coarse-lock ops/sec |
+|---:|---:|---:|
+| 1 | 375k/s | 23.8M/s |
+| 2 | 572k/s | 3.20M/s |
+| 4 | 554k/s | 1.39M/s |
+
+**Takeaways:**
+- **MVCC throughput holds roughly flat from 1 to 4 threads; the coarse-lock
+  baseline collapses ~17x over the same range** (23.8M/s → 1.39M/s). This is
+  the headline result this benchmark exists to produce: fine-grained,
+  per-key locking (`MVCCStore`'s `VersionChain` mutexes) lets independent
+  transactions on different keys make progress in parallel, while a single
+  global mutex serializes *every* operation regardless of which keys are
+  touched — the more threads contend for it, the worse it gets.
+- **MVCC's absolute per-operation throughput is far lower than the
+  coarse-lock baseline's** (roughly 60x slower single-threaded). This is
+  expected, not a bug: every autocommit op here pays for a full
+  `Begin`/`Commit` pair — a `Transaction` heap allocation, two atomic
+  counter increments, a transaction-shard mutex acquisition on insert and
+  again on erase, plus the version-chain machinery itself — against a
+  workload that's `unordered_map::find`/`operator[]` for the baseline.
+  MVCC's cost buys transactional semantics (snapshots, isolation levels,
+  atomic multi-key commits) the baseline doesn't have; the fair comparison
+  is the *scaling shape*, not the absolute numbers, which is why this
+  benchmark reports both.
+- **Getting the "holds flat" result required fixing a real bottleneck
+  first.** The initial `MVCCStore` implementation used one
+  `std::unordered_map`+`std::mutex` for the whole active-transaction table.
+  Since every autocommit op does exactly one `Begin` (table insert) and one
+  `Commit` (table erase), that single mutex was contended on nearly every
+  operation regardless of which key it touched — the fine-grained
+  `VersionChain` locking never got a chance to matter. Measured with that
+  version, throughput *fell* from 1 to 4 threads (450k/s → 168k/s) instead
+  of holding steady. The fix — sharding the transaction table into 16
+  independently-locked shards by `txn_id % 16` — is what produces the flat
+  line above; see DESIGN.md for the full story. Same pattern as Phase 3's
+  compaction-starvation bug and Phase 4's checkpoint-scan bug: a benchmark
+  built to demonstrate a property instead caught a bug that was hiding it.
+- **Correctness under concurrency is checked separately, not by this
+  benchmark.** `MVCCStoreTest.ConcurrentIncrementNoLostUpdates`
+  (`test/mvcc/mvcc_store_test.cpp`) runs 4 real threads doing 200
+  read-increment-write-commit cycles each against a shared counter, with
+  retry-on-conflict, and asserts the final value is exactly `threads ×
+  increments` — proving first-committer-wins conflict detection actually
+  prevents lost updates rather than just looking plausible under a
+  throughput benchmark that never checks final state.

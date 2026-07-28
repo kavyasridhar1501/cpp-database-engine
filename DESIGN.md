@@ -486,6 +486,148 @@ left dangling (an 'A' with no matching 'C'), and only that one key's
 outcome is genuinely ambiguous — every other key's last 'C' value must
 match the DB exactly. See `test/crash/crash_recovery_test.cpp`.
 
+## Phase 5 — MVCC Concurrency
+
+**`MVCCStore` is deliberately not a `StorageEngine`.** The
+`Get`/`Put`/`Delete`/`Scan` interface both disk engines implement has no
+concept of a transaction boundary or an isolation level, and demonstrating
+those is the entire point of this phase. Retrofitting `StorageEngine` to
+carry an implicit txn per call (as `WALBPlusTreeEngine` does for atomicity)
+would either flatten every read to its own snapshot — making the anomalies
+this phase is supposed to demonstrate impossible to show — or silently
+change the interface's contract for the two engines already built against
+it. `MVCCStore` instead sits beside the disk engines as a third, self-
+contained component with a richer API
+(`Begin`/`Read`/`Write`/`Delete`/`Commit`/`Abort`) modeled on
+`WALBPlusTreeEngine`'s explicit-transaction shape, but in-memory only — the
+concurrency-control problem is orthogonal to the durability problem Phase 4
+already solved, and combining them (an MVCC engine that's also disk-backed
+and WAL-logged) would be a substantial project in its own right rather than
+a natural extension of either.
+
+**Snapshot isolation does not prevent write skew — and this project shows
+that honestly rather than papering over it.** The original brief asks for a
+demonstration where "dirty read, non-repeatable read, and write skew appear
+under weak isolation and vanish under MVCC." Taken literally that's not
+achievable: it's a well-established result (Berenson et al., *A Critique of
+ANSI SQL Isolation Levels*, 1995; Fekete et al., *Making Snapshot Isolation
+Serializable*, 2005) that plain snapshot isolation (SI) — what most people
+mean by "MVCC" — closes dirty reads and non-repeatable reads but not write
+skew, because SI only checks for write-write conflicts, and write skew is a
+read-write (rw) anti-dependency between two transactions that never write
+the same key. Rather than either contradicting that theory to match the
+brief's wording, or silently building full Cahill-et-al. Serializable
+Snapshot Isolation (a materially larger undertaking — real SSI tracks
+rw-antidependency edges between *all* concurrently active transactions and
+detects dangerous structures in that graph, not just conflicts against the
+committing transaction), this phase implements four isolation levels and is
+explicit about which anomaly each one closes:
+
+| Isolation level | Dirty read | Non-repeatable read | Write skew |
+|---|---|---|---|
+| `READ_UNCOMMITTED` | visible | visible | visible |
+| `READ_COMMITTED` | prevented | visible | visible |
+| `SNAPSHOT` | prevented | prevented | **visible** (textbook SI behavior) |
+| `SERIALIZABLE_SNAPSHOT` | prevented | prevented | prevented |
+
+`SERIALIZABLE_SNAPSHOT` is a simplified, conservative SSI-*lite*: at commit
+time it checks the transaction's read set (not just its write set) for
+values written and committed by someone else after the transaction's
+snapshot began, which catches the classic two-key write-skew pattern (each
+side reads both keys, writes a different one) without implementing the full
+rw-antidependency graph. It will reject some transactions a full SSI
+implementation would allow (it doesn't distinguish "dangerous structure"
+from "any rw-conflict on a read key"), trading precision for
+implementability — a documented, deliberate simplification in the same
+spirit as Phase 4's sharp checkpoints. See
+`test/mvcc/mvcc_store_test.cpp`'s `WriteSkew*` tests for the exact
+interleaving that makes this concrete: the same two-transaction schedule
+commits both sides under `SNAPSHOT` (violating the "at least one doctor on
+call" invariant) and aborts the second committer under
+`SERIALIZABLE_SNAPSHOT`.
+
+**Version chains, not a single mutable slot.** Each key maps to a
+`VersionChain` — a `std::list<Version>` behind its own `std::mutex`, `list`
+specifically chosen so a transaction's `WriteRecord` can hold a *stable
+iterator* into the chain, giving O(1) commit (flip `committed`/`commit_ts`
+through the stored iterator) and O(1) abort (erase through the stored
+iterator) instead of a linear re-search. Each `Version` carries both a
+`seq` (assigned at write time, a total order over writes regardless of
+commit status — all `READ_UNCOMMITTED` needs) and a `commit_ts` (assigned
+only at commit time — what `READ_COMMITTED`/`SNAPSHOT`/
+`SERIALIZABLE_SNAPSHOT` order by). Read-your-own-writes is unconditional:
+`Read()` always checks for the calling transaction's own pending version
+first, before consulting isolation-level visibility rules, because a
+transaction should always see its own uncommitted writes regardless of what
+isolation level it's running under.
+
+**Commit-time conflict detection uses first-committer-wins, with chains
+locked in a fixed global order to avoid deadlock.** `Commit()` collects
+every key it needs to conflict-check (the write set always, plus the read
+set under `SERIALIZABLE_SNAPSHOT`), sorts and dedups them, then locks each
+key's `VersionChain` mutex *in that sorted order* before checking anything.
+Two transactions committing concurrently over overlapping key sets will
+therefore always try to acquire those mutexes in the same relative order,
+which rules out the classic "A locks X then waits for Y; B locks Y then
+waits for X" deadlock without needing a deadlock detector or a lock-wait
+timeout. A transaction aborts (and its writes are discarded) if any locked
+key already has a version committed by someone else *after* this
+transaction's snapshot began (`commit_ts > start_ts`) — first-committer-
+wins, not first-writer-wins, since a losing writer with no conflicting
+*committed* version by commit time should still be allowed to proceed.
+
+**Garbage collection tracks every active transaction's `start_ts`, not just
+the oldest one.** The first version of `RunGarbageCollection()` computed a
+single `min_active_start_ts` and reclaimed any committed version once the
+next-newer version's `commit_ts` fell at or before that minimum. That's
+*safe* (it never reclaims a version some active snapshot still needs) but
+needlessly conservative: with two active readers holding different
+snapshots, a version needed only by the *newer* reader would be kept
+correctly, but so would every version between the oldest reader's boundary
+and the newest committed version, even ones neither reader can see. The
+final version instead computes the full set of active `start_ts` values and
+reclaims a committed version `v` exactly when no active transaction's
+`start_ts` falls in `[v.commit_ts, next_newer.commit_ts)` — the half-open
+interval during which `v` is precisely what that snapshot would resolve to.
+`test/mvcc/mvcc_store_test.cpp`'s `GarbageCollectionRespectsActiveSnapshot`
+exercises this directly: a long-running reader holding an old snapshot
+keeps exactly the one version it needs (plus the current version), while
+versions in between — committed after the reader's snapshot but superseded
+before the current one — get reclaimed.
+
+**The throughput-scaling benchmark caught a real bottleneck before this
+section was even written: a single global mutex guarding the entire
+transaction table.** The initial implementation stored all active
+transactions in one `std::unordered_map<int64_t, std::unique_ptr<Transaction>>`
+behind one `std::mutex`. Per-key `VersionChain` locking was already
+fine-grained, but every `Begin` (insert), every `Read`/`Write`/`Delete`
+(lookup), and every `Commit`/`Abort` (erase) still had to take that one
+mutex — meaning autocommit-style short transactions (the common case the
+benchmark exercises: one `Begin`/op/`Commit` per operation) serialized on
+it almost entirely regardless of which keys they touched. The
+throughput-scaling benchmark (`benchmark/mvcc_bench.cpp`) exposed this
+directly: measured throughput *fell* from 1 to 4 threads (450k/s → 168k/s)
+instead of holding steady, the opposite of what fine-grained per-key
+locking should produce. The fix is sharding the transaction table into 16
+independently-locked shards keyed by `txn_id % 16` (`MVCCStore::TxnShard`,
+same technique the buffer pool and LSM-tree already use elsewhere in this
+project for exactly this reason), so concurrent transactions on different
+threads mostly land in different shards. After the fix, throughput holds
+essentially flat from 1 to 4 threads instead of collapsing — see
+BENCHMARKS.md for the numbers. This is the same "the benchmark wasn't just
+reporting a number, it falsified a design assumption" pattern as Phase 3's
+compaction-starvation bug and Phase 4's checkpoint-scan bug.
+
+**Concurrency-safety contract: one thread drives a given `txn_id` at a
+time.** `Begin`/`Read`/`Write`/`Delete`/`Commit`/`Abort` are never called
+concurrently for the *same* `txn_id` from two threads — a standard
+one-thread-per-session model, the same assumption `WALBPlusTreeEngine`'s
+transaction API makes. This is what allows `Transaction`'s own fields
+(`read_set`, `write_set`, `write_records`) to be touched without a
+per-transaction lock once safely looked up from its shard under
+`TxnShard::mutex`: no other thread can be concurrently mutating or erasing
+that same transaction.
+
 ## Deferred to later phases
 
 - Free-page reuse in `BPlusTree`'s on-disk page ids specifically (SSTables
@@ -496,8 +638,17 @@ match the DB exactly. See `test/crash/crash_recovery_test.cpp`.
   next step if that cost needs to come down.
 - Per-page latching in `BufferPoolManager`, latch crabbing in `BPlusTree`,
   and finer-grained locking in `LSMTreeEngine`/`WALBPlusTreeEngine` (all
-  currently one coarse mutex per structure) — revisit under MVCC (Phase 5)
-  if contention measurements justify it.
+  currently one coarse mutex per structure) — `MVCCStore`'s per-key
+  `VersionChain` locking (Phase 5) is this project's one example of what
+  finer-grained locking looks like in practice; revisit the disk engines if
+  contention measurements ever justify the added complexity.
+- Full Cahill-et-al. Serializable Snapshot Isolation (real rw-antidependency
+  graph tracking with dangerous-structure detection) in place of Phase 5's
+  simplified `SERIALIZABLE_SNAPSHOT` — see the Phase 5 section above for
+  exactly what the simplification gives up.
+- MVCC version chains persisted to disk / integrated with the WAL, instead
+  of `MVCCStore` being an in-memory-only component alongside the two disk
+  engines.
 - O(1)/O(log n) eviction for `LRUKReplacer`/`LRUReplacer` (currently linear
   scan) — revisit if buffer pool sizes grow enough to make it matter; the
   Phase 2 insert-throughput benchmark is partly bottlenecked on this (each

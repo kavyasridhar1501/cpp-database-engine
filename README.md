@@ -11,7 +11,7 @@ Built in phases, each with its own tests and benchmark numbers — see
 [DESIGN.md](DESIGN.md) for trade-off notes and [BENCHMARKS.md](BENCHMARKS.md)
 for results.
 
-## Status: Phase 4 — Write-Ahead Log & ARIES-Style Recovery
+## Status: Phase 5 — MVCC Concurrency
 
 - `DiskManager` (`src/storage/disk/`): page-granular (4096-byte, fixed at
   compile time) reads/writes over a single heap file via `pread`/`pwrite`.
@@ -40,21 +40,34 @@ for results.
   recovery that jumps straight to the last checkpoint instead of scanning
   the whole log. `LSMTreeEngine` gets a smaller, optional redo-only WAL for
   its memtable (no transactions/undo needed — see DESIGN.md for why).
+- `MVCCStore` (`src/mvcc/`): an in-memory, multi-versioned key/value store
+  with four isolation levels (`READ_UNCOMMITTED`, `READ_COMMITTED`,
+  `SNAPSHOT`, `SERIALIZABLE_SNAPSHOT`) — per-key version chains, explicit
+  `Begin`/`Read`/`Write`/`Delete`/`Commit`/`Abort` transactions,
+  first-committer-wins conflict detection with deadlock-free chain locking,
+  and background-safe garbage collection of versions no longer visible to
+  any active snapshot. Deliberately sits beside `StorageEngine` rather than
+  implementing it — see DESIGN.md for why.
 - A minimal CLI shell (`alloc` / `write` / `read` / `stats`) for poking raw
   pages by hand.
-- GoogleTest suite (106 tests): DiskManager, replacer, BufferPoolManager,
-  B+-tree, LSM-tree, and WAL/recovery correctness, including randomized
-  oracle tests for each engine; a `LogManager` test suite; a
-  `WALBPlusTreeEngine` suite covering transactions, live abort/undo,
-  checkpointing, and simulated-crash recovery; and a **crash-injection
-  harness** that forks a real worker process, `SIGKILL`s it at a random
-  point, and verifies recovered state against an independent oracle — 150
-  cycles against the B+-tree, 100 against the LSM-tree, every push.
+- GoogleTest suite (123 tests): DiskManager, replacer, BufferPoolManager,
+  B+-tree, LSM-tree, WAL/recovery, and MVCC correctness, including
+  randomized oracle tests for each storage engine; a `LogManager` test
+  suite; a `WALBPlusTreeEngine` suite covering transactions, live
+  abort/undo, checkpointing, and simulated-crash recovery; a
+  **crash-injection harness** that forks a real worker process, `SIGKILL`s
+  it at a random point, and verifies recovered state against an
+  independent oracle — 150 cycles against the B+-tree, 100 against the
+  LSM-tree, every push; and an `MVCCStore` suite demonstrating dirty read,
+  non-repeatable read, and write skew each appearing and then vanishing
+  under the appropriate isolation level, plus a real multi-threaded
+  no-lost-updates stress test and GC correctness tests.
 - Google Benchmark suites: disk I/O; a Zipfian LRU-K-vs-LRU hit-rate curve;
   B+-tree point-lookup/range-scan/insert-throughput at 1M/10M keys; a
   head-to-head B+-tree-vs-LSM-tree comparison across write-heavy to
-  read-heavy workloads; and WAL recovery-time-vs-log-size (with and without
-  checkpointing) plus WAL-on-vs-off throughput cost.
+  read-heavy workloads; WAL recovery-time-vs-log-size (with and without
+  checkpointing) plus WAL-on-vs-off throughput cost; and MVCC throughput
+  scaling from 1 to 4 threads against a coarse-lock baseline.
 - GitHub Actions CI (build + test + CLI smoke test + Docker build) on every
   push.
 - Docker image that builds the engine and runs the CLI.
@@ -116,8 +129,8 @@ docker run --rm -it -v dbengine-data:/home/dbengine/data dbengine
 1. Buffer Pool Manager (LRU-K eviction)
 2. Engine A: disk-backed B+-tree
 3. Engine B: LSM-tree (memtable, SSTables, compaction, Bloom filters)
-4. Write-ahead log & ARIES-style crash recovery *(current)*
-5. MVCC concurrency (snapshot isolation)
+4. Write-ahead log & ARIES-style crash recovery
+5. MVCC concurrency (snapshot isolation) *(current)*
 6. SQL front-end & cost-based optimizer
 7. Validation against SQLite, TPC-C/H-style workload
 8. Deployment (GHCR image, results page, optional read-only HTTP API)

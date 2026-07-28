@@ -13,6 +13,7 @@ add_library(dbengine_core
   lsm/lsm_tree_engine.cpp
   wal/log_manager.cpp
   wal/wal_b_plus_tree_engine.cpp
+  mvcc/mvcc_store.cpp
 )
 
 target_include_directories(dbengine_core

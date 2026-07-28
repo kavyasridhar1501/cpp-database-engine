@@ -31,6 +31,7 @@ add_executable(dbengine_tests
   wal/log_manager_test.cpp
   wal/wal_b_plus_tree_engine_test.cpp
   crash/crash_recovery_test.cpp
+  mvcc/mvcc_store_test.cpp
 )
 
 target_include_directories(dbengine_tests

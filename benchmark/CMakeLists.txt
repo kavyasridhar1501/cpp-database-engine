@@ -4,6 +4,7 @@ add_executable(dbengine_bench
   b_plus_tree_bench.cpp
   engine_comparison_bench.cpp
   wal_bench.cpp
+  mvcc_bench.cpp
 )
 
 target_include_directories(dbengine_bench
