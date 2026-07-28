@@ -1,10 +1,10 @@
 # Benchmarks
 
-Running log of benchmark results, phase by phase. All numbers are from
-Google Benchmark (`benchmark/`) and are indicative, not authoritative —
-re-run `reproduce` on your own hardware before citing a number.
+Results log, phase by phase. All numbers are from Google Benchmark
+(`benchmark/`) and are indicative, not authoritative. Re-run on your own
+hardware before citing a number.
 
-## How to reproduce
+## Reproduce
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -12,569 +12,404 @@ cmake --build build --parallel
 ./build/benchmark/dbengine_bench
 ```
 
-Add `--benchmark_filter=<regex>` to run a subset, `--benchmark_repetitions=N`
-for statistical stability, or `--benchmark_out=results.json
---benchmark_out_format=json` to save machine-readable output.
+- `--benchmark_filter=<regex>` runs a subset.
+- `--benchmark_repetitions=N` for statistical stability.
+- `--benchmark_out=results.json --benchmark_out_format=json` for
+  machine-readable output.
 
-## Phase 0 — Disk Manager
+## Phase 0: Disk Manager
 
-**What's measured:** `DiskManager::ReadPage` / `WritePage` latency and
-throughput over a single 16 MiB heap file (4096 pages x 4096 bytes), pages
-pre-allocated (and, for read benchmarks, pre-written) before timing starts so
-first-touch effects don't pollute the numbers. "Sequential" walks page ids
-`0..N-1` in order; "random" walks a fixed Fisher-Yates shuffle of the same
-page ids. Both hit the OS page cache (no `O_DIRECT`, no cache-drop between
-runs), so this is measuring the `pread`/`pwrite` + page-cache path, not raw
-disk hardware — that's the right thing to measure here, since everything
-above `DiskManager` (buffer pool, engines) will also see the OS cache.
+**What's measured**: `ReadPage`/`WritePage` latency and throughput over a
+16 MiB heap file (4096 pages x 4096 bytes). Pages are pre-allocated (and
+pre-written, for reads) before timing starts. "Sequential" walks page IDs
+in order; "random" walks a fixed shuffle. Both hit the OS page cache (no
+`O_DIRECT`), so this measures the `pread`/`pwrite` + cache path.
 
-**Environment this run:** 4-core Intel Xeon @ 2.10GHz, containerized sandbox
-(cloud dev environment, not bare metal) — throughput numbers will vary
-significantly on real hardware/NVMe and are recorded here for trend-tracking
-across phases, not as an absolute performance claim.
+Environment: 4-core sandbox, containerized (not bare metal). Numbers are
+for trend-tracking across phases, not an absolute hardware claim.
 
-**Results** (`--benchmark_min_time=0.5s`, Release build, GCC 13):
+| Benchmark | Time/op | Throughput |
+|---|---|---|
+| `BM_SequentialWrite` | 565 ns | 6.75 GiB/s |
+| `BM_RandomWrite` | 605 ns | 6.30 GiB/s |
+| `BM_SequentialRead` | 458 ns | 8.33 GiB/s |
+| `BM_RandomRead` | 516 ns | 7.39 GiB/s |
 
-| Benchmark           | Time/op  | Throughput   |
-|---------------------|----------|--------------|
-| `BM_SequentialWrite` | 565 ns  | 6.75 GiB/s   |
-| `BM_RandomWrite`     | 605 ns  | 6.30 GiB/s   |
-| `BM_SequentialRead`  | 458 ns  | 8.33 GiB/s   |
-| `BM_RandomRead`      | 516 ns  | 7.39 GiB/s   |
+Takeaways:
+- Sequential beats random for both reads and writes, but by only 7-12%.
+  This 16 MiB working set fits comfortably in page cache, so there's no
+  real seek cost yet. The gap should widen once Phase 1 tests a working
+  set that doesn't fit in RAM.
+- Reads are consistently faster than writes. Matches `pwrite` going
+  through dirty-page bookkeeping while `pread` on a cached page is close
+  to a memcpy.
+- These numbers are the baseline for Phase 1's hit-rate benchmark and
+  Phase 2's point-lookup/insert numbers: both get judged against "how much
+  better than raw page I/O," not in isolation.
 
-**Takeaways:**
-- Sequential is faster than random for both reads and writes, as expected,
-  but the gap is small (~7-12%) because this working set (16 MiB) comfortably
-  fits in the page cache — there's no real seek cost to amortize since
-  nothing touches physical disk layout at this phase. The gap should widen
-  once Phase 1's buffer pool is tested against a working set that doesn't fit
-  in RAM, and again once real disks (vs. this sandbox's block storage) are in
-  the loop.
-- Reads are consistently faster than writes, consistent with `pwrite` going
-  through the page cache's dirty-page bookkeeping while `pread` on a
-  recently-written (cached) page is closer to a memcpy.
-- These numbers are the Phase 0 baseline for the buffer-pool hit-rate
-  benchmark in Phase 1 (cache hit-rate curve vs. pool size) and the point
-  lookup / insert throughput numbers in Phase 2 — both will be judged against
-  "how much better than raw page I/O" rather than in isolation.
+## Phase 1: Buffer Pool Manager (LRU-K vs plain LRU)
 
-## Phase 1 — Buffer Pool Manager (LRU-K vs. plain LRU)
-
-**What's measured:** cache hit rate as a function of buffer pool size (in
-frames), for `BufferPoolManager` configured with the production replacer
-(`LRUKReplacer`, k=2) versus the plain-LRU baseline (`LRUReplacer`), replaying
-the *same* fixed access trace through both. Each data point is a single
-deterministic replay (`->Iterations(1)`) against a fresh `DiskManager` file
-and fresh `BufferPoolManager` — no state carries over between pool sizes or
-between replacers.
+**What's measured**: cache hit rate vs buffer pool size, for
+`LRUKReplacer` (k=2) vs `LRUReplacer`, replaying the same fixed access
+trace through both. Each data point is a single deterministic replay
+against a fresh `DiskManager` and `BufferPoolManager`.
 
 Two traces:
-- **`Zipfian`**: 200,000 accesses over 10,000 pages, Zipfian skew 0.99 (the
-  standard YCSB default) — a small set of pages absorbs most of the traffic,
-  matching real skewed key-popularity.
-- **`ZipfianWithScan`**: 100,000 Zipfian accesses over a 2,000-page hot set,
-  with a 300-page cold sequential scan (over a disjoint 2,000-page cold
-  range) injected every 2,000 accesses — the standard workload for exposing
-  a replacement policy's vulnerability to "sequential flooding" (O'Neil,
-  O'Neil & Weikum, SIGMOD 1993).
+- **Zipfian**: 200,000 accesses over 10,000 pages, skew 0.99 (YCSB
+  default).
+- **ZipfianWithScan**: 100,000 Zipfian accesses over a 2,000-page hot set,
+  with a 300-page cold scan injected every 2,000 accesses. Standard
+  workload for exposing sequential-flooding vulnerability (O'Neil, O'Neil
+  & Weikum, SIGMOD 1993).
 
-**Reproduce:**
+**Reproduce**:
 ```sh
 ./build/benchmark/dbengine_bench --benchmark_filter='Zipfian'
 ```
 
-**Results** (4-core sandbox, same caveats as Phase 0 — trend data, not a
-hardware claim):
+**Zipfian trace** (`BM_Zipfian_LRUK` vs `BM_Zipfian_LRU`):
 
 | Pool size | LRU-K hit rate | LRU hit rate | LRU-K advantage |
-|-----------|---------------:|-------------:|-----------------:|
-| 8         | 24.0%          | 10.4%        | +13.6 pts |
-| 16        | 31.4%          | 16.8%        | +14.6 pts |
-| 32        | 38.8%          | 24.5%        | +14.3 pts |
-| 64        | 46.2%          | 32.5%        | +13.7 pts |
-| 128       | 52.6%          | 40.6%        | +12.0 pts |
-| 256       | 58.5%          | 49.0%        | +9.5 pts |
-| 512       | 65.2%          | 57.6%        | +7.6 pts |
-| 1024      | 72.3%          | 66.5%        | +5.8 pts |
-| 2048      | 79.6%          | 75.9%        | +3.8 pts |
+|---|---|---|---|
+| 8 | 24.0% | 10.4% | +13.6 pts |
+| 16 | 31.4% | 16.8% | +14.6 pts |
+| 32 | 38.8% | 24.5% | +14.3 pts |
+| 64 | 46.2% | 32.5% | +13.7 pts |
+| 128 | 52.6% | 40.6% | +12.0 pts |
+| 256 | 58.5% | 49.0% | +9.5 pts |
+| 512 | 65.2% | 57.6% | +7.6 pts |
+| 1024 | 72.3% | 66.5% | +5.8 pts |
+| 2048 | 79.6% | 75.9% | +3.8 pts |
 
-*(pure Zipfian trace; `BM_Zipfian_LRUK` vs `BM_Zipfian_LRU`)*
+**Zipfian + scan pollution** (`BM_ZipfianWithScan_LRUK` vs `_LRU`):
 
 | Pool size | LRU-K hit rate | LRU hit rate | LRU-K advantage |
-|-----------|---------------:|-------------:|-----------------:|
-| 8         | 25.1%          | 12.6%        | +12.5 pts |
-| 16        | 33.2%          | 20.0%        | +13.2 pts |
-| 32        | 40.9%          | 28.2%        | +12.7 pts |
-| 64        | 47.8%          | 36.6%        | +11.2 pts |
-| 128       | 54.8%          | 45.0%        | +9.8 pts |
-| 256       | 61.7%          | 52.8%        | +8.9 pts |
-| 512       | 69.0%          | 60.5%        | +8.5 pts |
-| 1024      | 76.8%          | 70.5%        | +6.3 pts |
+|---|---|---|---|
+| 8 | 25.1% | 12.6% | +12.5 pts |
+| 16 | 33.2% | 20.0% | +13.2 pts |
+| 32 | 40.9% | 28.2% | +12.7 pts |
+| 64 | 47.8% | 36.6% | +11.2 pts |
+| 128 | 54.8% | 45.0% | +9.8 pts |
+| 256 | 61.7% | 52.8% | +8.9 pts |
+| 512 | 69.0% | 60.5% | +8.5 pts |
+| 1024 | 76.8% | 70.5% | +6.3 pts |
 
-*(Zipfian + periodic scan-pollution trace; `BM_ZipfianWithScan_LRUK` vs
-`BM_ZipfianWithScan_LRU`)*
+Takeaways:
+- LRU-K beats plain LRU at every pool size tested, on both traces.
+- The advantage is largest at small pool sizes (+13-15 points at 8-64
+  frames) and narrows as the pool grows large enough to hold most of the
+  hot set. LRU-K's edge is not letting one recent touch buy a scarce
+  cache slot, and that matters most when the cache is scarce.
+- The scan-pollution trace doesn't show a bigger gap than plain Zipfian.
+  At these parameters (300-page scan every 2,000 accesses, 2,000-page hot
+  set), the scan isn't large enough relative to the hot set to fully flush
+  it under LRU either. A bigger scan-to-hot-set ratio would likely widen
+  the gap.
+- `BM_Zipfian_LRUK` slows down more than `BM_Zipfian_LRU` as pool size
+  grows (63ms to 729ms from size 8 to 2048, vs LRU's flat ~50-65ms). Both
+  replacers scan their evictable set on every eviction; LRU-K's per-frame
+  work is heavier. A scaling limitation, not a correctness issue, and it
+  doesn't affect the hit-rate result above.
 
-**Takeaways:**
-- LRU-K beats plain LRU at *every* pool size tested, on both traces — the
-  deliverable's "beat plain LRU on the same trace" bar is met without
-  qualification.
-- The advantage is largest at small pool sizes (roughly +13-15 points at
-  8-64 frames) and narrows as the pool gets large enough to hold most of the
-  hot set anyway (both policies converge toward the trace's inherent hit
-  ceiling). This matches the theory: LRU-K's edge comes from not letting a
-  single recent touch buy a page a spot in a scarce cache, and that edge
-  matters most exactly when the cache is scarce.
-- The scan-pollution trace doesn't show a *larger* gap than pure Zipfian
-  here — both traces show LRU-K winning by a similar margin — which is a bit
-  softer than the "LRU-K crushes LRU under scans" story sometimes told for
-  this workload. At these scan parameters (300-page scan every 2,000
-  accesses, hot set of only 2,000 pages) the scan isn't large or frequent
-  enough relative to the hot set to fully flush it under LRU either. A
-  bigger scan-to-hot-set ratio would likely widen the gap further; the
-  honest result here is that LRU-K wins clearly on both a plain skewed
-  workload and a scan-polluted one, without needing the scan to make its
-  case.
-- `BM_Zipfian_LRUK` runtime grows noticeably faster than `BM_Zipfian_LRU`'s
-  as pool size increases (63ms → 729ms from pool size 8 to 2048, vs. LRU's
-  roughly flat ~50-65ms). Both replacers scan their evictable set on every
-  eviction (see DESIGN.md), but LRU-K's per-frame work (deque bookkeeping,
-  the +inf/finite comparison) is heavier per element — a known, documented
-  scaling limitation, not a correctness issue, and irrelevant to the hit-rate
-  result above.
+## Phase 2: B+-Tree (Engine A)
 
-## Phase 2 — B+-Tree (Engine A)
+**What's measured**: point-lookup latency, range-scan throughput, and
+insert throughput at 1M and 10M keys via `BPlusTreeEngine`. Keys insert in
+shuffled order for all three benchmarks. Buffer pool is fixed at 2,000
+frames (8MB) for both scales: ~10.5% of the 1M-key dataset, ~1.05% of the
+10M-key one.
 
-**What's measured:** point-lookup latency, range-scan throughput, and
-insert throughput at 1M and 10M keys, via `BPlusTreeEngine` (the
-`StorageEngine` adapter). Keys are inserted in **shuffled**, not sequential,
-order for all three benchmarks — see DESIGN.md for why. The buffer pool is
-fixed at 2,000 frames (8MB) for both scales: ~10.5% of the 1M-key dataset
-(~76MB) but only ~1.05% of the 10M-key one (~760MB), i.e. an index that
-doesn't fit in RAM at either scale, and proportionally less of it fits as N
-grows.
-
-**Reproduce:**
+**Reproduce**:
 ```sh
 ./build/benchmark/dbengine_bench --benchmark_filter='PointLookup|RangeScan|InsertThroughput'
 ```
-(The 10M-key insert-throughput run alone takes several minutes — filter it
-out with e.g. `--benchmark_filter='PointLookup|RangeScan'` for a quick
-check.)
-
-**Results** (4-core sandbox, same caveats as Phase 0/1 — trend data, not a
-hardware claim):
+The 10M-key insert run alone takes several minutes. Filter it out with
+`--benchmark_filter='PointLookup|RangeScan'` for a quick check.
 
 | Benchmark | 1M keys | 10M keys |
-|---|---:|---:|
-| Point lookup (random key) | 23.5 µs/op (42.5k ops/s) | 25.8 µs/op (38.8k ops/s) |
-| Range scan (1,000-key window, random start) | 546 µs/scan (1.83M keys/s) | 599 µs/scan (1.67M keys/s) |
-| Insert throughput (fresh tree, shuffled keys) | 18.67 s total (53.6k ops/s) | 276.2 s total (36.2k ops/s) |
+|---|---|---|
+| Point lookup (random key) | 23.5 us/op (42.5k ops/s) | 25.8 us/op (38.8k ops/s) |
+| Range scan (1,000-key window) | 546 us/scan (1.83M keys/s) | 599 us/scan (1.67M keys/s) |
+| Insert throughput (fresh tree, shuffled) | 18.67s total (53.6k ops/s) | 276.2s total (36.2k ops/s) |
 
-**Takeaways:**
-- **Point lookup barely changes across a 10x increase in data** (23.5µs →
-  25.8µs, +10%) — this is the B+-tree's core promise showing up directly in
-  the numbers. A lookup costs one page fetch per tree level, tree height
-  grows logarithmically (both 1M and 10M keys fit in a 3-level tree at this
-  fanout), so the dominant cost per lookup — descending from root to leaf
-  under a mostly-cold buffer pool — is nearly flat regardless of N.
-- **Range scan is similarly flat** (1.83M → 1.67M keys/s) since it's
-  dominated by walking the leaf chain, a cost per key that doesn't depend
-  on tree depth at all.
-- **Insert throughput drops substantially at scale** (53.6k → 36.2k ops/s,
-  -32%) — unlike the two read paths, this one is *not* flat, and that's the
-  most interesting result in this section. The B+-tree's own algorithmic
-  cost per insert is still O(log N) (same shallow-tree argument as lookups),
-  so the slowdown isn't the tree getting structurally harder to navigate —
-  it's that the fixed 2,000-frame buffer pool is a shrinking fraction of a
-  growing dataset, so a larger share of each insert's page touches (finding
-  the leaf, touching siblings during a split, updating parent pointers)
-  miss the pool and pay for real page I/O plus an LRU-K eviction (itself an
-  O(pool size) linear scan — see DESIGN.md). This is a genuine cost of
-  pairing a fixed-size buffer pool with an ever-growing B+-tree, not a bug,
-  and it's the baseline Phase 3's LSM-tree needs to beat: an LSM's write
-  path (append to an in-memory memtable, flush when full) is expected to
-  degrade much less with N, since it doesn't need to touch the on-disk
-  structure at all for most writes. That comparison is the Phase 3
-  deliverable.
+Takeaways:
+- Point lookup barely changes across a 10x increase in data (23.5us to
+  25.8us, +10%). A lookup costs one page fetch per tree level, and both
+  1M and 10M keys fit in a 3-level tree at this fanout.
+- Range scan is similarly flat (1.83M to 1.67M keys/s), dominated by
+  walking the leaf chain, a cost per key that doesn't depend on depth.
+- Insert throughput drops substantially at scale (53.6k to 36.2k ops/s,
+  -32%). The algorithmic cost per insert is still O(log N); the slowdown
+  is that the fixed 2,000-frame pool is a shrinking fraction of a growing
+  dataset, so more of each insert's page touches miss the pool and pay
+  for real I/O plus an LRU-K eviction. This is the baseline Phase 3's
+  LSM-tree needs to beat.
 
-## Phase 3 — Head-to-Head: B+-Tree vs. LSM-Tree
+## Phase 3: Head-to-Head, B+-Tree vs LSM-Tree
 
-**What's measured:** both engines, populated with the same 100,000 keys
-(shuffled insertion order, same methodology as Phase 2) and the same
-buffer-pool budget (2,000 frames for the B+-tree; the LSM-tree's SSTables
-each get their own small 8-frame pool — see DESIGN.md), then driven through
-a Zipfian-distributed (skew 0.99) mixed read/write workload swept across
-write fractions from 5% to 90%, plus a dedicated range-scan workload
-(500 scans of a 100-key window from random start points). Reported per
-point: throughput, average latency, disk reads per operation ("read
-amplification"), and total on-disk bytes versus the logical dataset size
-("space amplification").
+**What's measured**: both engines populated with the same 100,000 keys
+(shuffled order), same methodology as Phase 2, driven through a
+Zipfian-distributed mixed read/write workload swept across write
+fractions from 5% to 90%, plus a dedicated range-scan workload (500 scans
+of a 100-key window). Reported: throughput, latency, disk reads/op (read
+amplification), and on-disk bytes vs logical size (space amplification).
 
-**Reproduce:**
+**Reproduce**:
 ```sh
 ./build/benchmark/dbengine_bench --benchmark_filter='MixedWorkload|RangeScan_(BPlusTree|LSM)'
 ```
 
-**Results** (4-core sandbox, same caveats as earlier phases):
-
 | Write % | B+-tree ops/s | LSM ops/s | B+-tree reads/op | LSM reads/op |
-|--------:|--------------:|----------:|-----------------:|-------------:|
-| 5       | 541k          | 1.19M     | 0.106            | 0.401        |
-| 10      | 538k          | 1.27M     | 0.106            | 0.370        |
-| 30      | 560k          | 1.50M     | 0.106            | 0.263        |
-| 50      | 550k          | 1.58M     | 0.106            | 0.198        |
-| 70      | 550k          | 1.85M     | 0.106            | 0.119        |
-| 90      | 530k          | 1.97M     | 0.106            | 0.042        |
+|---|---|---|---|---|
+| 5 | 541k | 1.19M | 0.106 | 0.401 |
+| 10 | 538k | 1.27M | 0.106 | 0.370 |
+| 30 | 560k | 1.50M | 0.106 | 0.263 |
+| 50 | 550k | 1.58M | 0.106 | 0.198 |
+| 70 | 550k | 1.85M | 0.106 | 0.119 |
+| 90 | 530k | 1.97M | 0.106 | 0.042 |
 
 | Write % | B+-tree space amp | LSM space amp |
-|--------:|-------------------:|---------------:|
-| 5–30    | 7.56×               | 4.84×           |
-| 50–70   | 7.56×               | 5.34×           |
-| 90      | 7.56×               | 5.64×           |
+|---|---|---|
+| 5-30 | 7.56x | 4.84x |
+| 50-70 | 7.56x | 5.34x |
+| 90 | 7.56x | 5.64x |
 
-Range scan (100-key window, random start): B+-tree 51.8k scans/s (1.238
-disk reads/scan), LSM 88.2k scans/s (3.852 disk reads/scan).
+Range scan (100-key window): B+-tree 51.8k scans/s (1.238 reads/scan),
+LSM 88.2k scans/s (3.852 reads/scan).
 
-**Takeaways:**
-- **No throughput crossover in this range — the LSM-tree wins outright at
-  every write fraction tested**, and the gap *widens* as writes increase
-  (1.19M → 1.97M ops/s for the LSM-tree, essentially flat at ~530-560k for
-  the B+-tree). This is the direct, expected consequence of the two
-  write paths: a B+-tree write is a tree descent plus (at this buffer-pool
-  size) real page I/O, roughly constant cost regardless of what fraction of
-  the workload is writes; an LSM-tree write is an in-memory skip-list
-  insert that's O(1) amortized against disk (cost is paid later, in bulk,
-  at flush/compaction time). At no point in the 5-90% range does adding
-  more writes hurt the LSM-tree's throughput — if anything it helps, since
-  fewer of the ops are the (relatively) more expensive multi-SSTable reads.
-- **The classic B+-tree/LSM-tree crossover shows up clearly in read
-  amplification instead, and it *does* cross within the tested range.**
-  The B+-tree's disk-reads-per-op is flat at ~0.106 regardless of workload
-  mix (a lookup always costs the same tree descent). The LSM-tree's is
-  workload-dependent: 0.401 reads/op at 5% writes (mostly reads, each one
-  potentially checking several SSTables past the memtable) down to 0.042 at
-  90% writes (mostly writes, which are memtable-only; the few reads that do
-  happen more often hit the memtable or the first SSTable checked). The two
-  lines cross somewhere around 75-85% writes — below that, the LSM-tree
-  reads more pages per operation than the B+-tree does; above it, fewer.
-  This is the textbook LSM trade-off (cheap writes, potentially-amplified
-  reads) made directly measurable, and it's *why* Bloom filters matter: at
-  5% writes the LSM-tree is still only touching 0.4 pages/op on average
-  across however many SSTables exist, because a Bloom filter miss costs
-  nothing (a bit-array check, no disk I/O) — without it, this number would
-  be far higher and the crossover point would shift well to the right.
-- **Space amplification is higher for the B+-tree (7.56×) than the
-  LSM-tree (4.84-5.64×) at every write fraction, and for a specific,
-  identifiable reason, not because one engine is "worse."** Both engines
-  pay the same fixed-size-value tax documented in DESIGN.md (every ~8-byte
-  test value padded to a 64-byte slot) — that alone accounts for roughly
-  4-5× of both numbers. The B+-tree's *additional* overhead beyond that
-  comes from page fill factor: random-order inserts and B-tree splits
-  leave leaf pages roughly 65-70% full on average (a well-known property of
-  B-trees under random insertion), whereas the LSM-tree's SSTable builder
-  bulk-packs sorted data into pages at essentially 100% fill (only the last
-  page of a run is ever partially empty). That fill-factor gap is a real,
-  structural LSM advantage — bulk-sorted writes pack tighter than
-  incremental random-order ones — independent of the fixed-value-size tax
-  both engines share.
-- **LSM space amplification grows with write fraction** (4.84× at 5% writes
-  → 5.64× at 90%), which is exactly the expected LSM behavior: more writes
-  mean more not-yet-compacted data sitting in tier 0 at any given moment
-  (updates to existing keys leave stale copies behind until compaction
-  removes them), so space amplification is a function of write load, not a
-  fixed constant — unlike the B+-tree, where it's roughly workload-
-  independent (updates overwrite in place; the tree's shape barely changes).
-- **Range scan: the LSM-tree is faster in raw throughput (88.2k vs. 51.8k
-  scans/s) despite reading more disk pages per scan (3.852 vs. 1.238).**
-  This looks counter-intuitive but has a specific cause: a single LSM scan
-  fans out across the memtable and multiple SSTables simultaneously (the
-  merge iterator holds one cursor per source), so "disk reads per scan"
-  counts touches across several small, page-cache-friendly per-SSTable
-  pools rather than one larger shared pool — more total page touches, but
-  each one cheaper on average given the sandbox's warm OS page cache. This
-  is more a statement about this benchmark's scale (100k keys, few tiers)
-  and the sandbox environment than a general claim that LSM range scans are
-  always faster; the more SSTables accumulate before compaction catches
-  up, the more cursors a scan fans out across, and that trend would
-  eventually reverse this result at larger scale or under heavier write
-  load — a good candidate for a deeper follow-up if this project continues
-  past its planned phases.
+Takeaways:
+- No throughput crossover in this range. The LSM-tree wins at every write
+  fraction tested, and the gap widens as writes increase (1.19M to 1.97M
+  ops/s for LSM, flat around 530-560k for the B+-tree). A B+-tree write is
+  a tree descent plus real page I/O; an LSM write is an in-memory
+  skip-list insert, paid for later at flush/compaction time.
+- The classic crossover shows up in read amplification instead, and it
+  does cross in the tested range. B+-tree reads/op is flat at ~0.106
+  regardless of workload. LSM's is workload-dependent: 0.401 at 5% writes
+  down to 0.042 at 90%. The two lines cross around 75-85% writes. This is
+  the textbook LSM trade-off (cheap writes, amplified reads) made
+  measurable, and it's why Bloom filters matter: at 5% writes the LSM-tree
+  still averages only 0.4 pages/op because a Bloom filter miss costs
+  nothing.
+- Space amplification is higher for the B+-tree (7.56x) than the LSM-tree
+  (4.84-5.64x) at every write fraction. Both engines pay the same
+  fixed-value-size tax (every ~8-byte test value padded to 64 bytes),
+  which accounts for roughly 4-5x of both numbers. The B+-tree's extra
+  overhead comes from page fill factor: random-order inserts leave leaf
+  pages 65-70% full on average, while the LSM-tree's SSTable builder
+  bulk-packs sorted data at close to 100% fill.
+- LSM space amplification grows with write fraction (4.84x at 5% writes to
+  5.64x at 90%), because more writes mean more not-yet-compacted stale
+  data sitting in tier 0 at any given moment. The B+-tree's is roughly
+  workload-independent since updates overwrite in place.
+- Range scan: the LSM-tree is faster in raw throughput (88.2k vs 51.8k
+  scans/s) despite reading more disk pages per scan (3.852 vs 1.238). A
+  single LSM scan fans out across the memtable and multiple SSTables, each
+  with its own small page-cache-friendly pool, so more total touches but
+  each one cheaper on average at this scale (100k keys, few tiers, warm
+  page cache). This trend would likely reverse at larger scale or heavier
+  write load.
 
-## Phase 4 — Write-Ahead Log & ARIES-Style Recovery
+## Phase 4: Write-Ahead Log & ARIES-Style Recovery
 
-**What's measured:** (1) recovery time (the `WALBPlusTreeEngine` constructor's
-cost when reopening a database with an existing log) as a function of how
-much log exists to replay, with and without periodic checkpointing; (2) the
-throughput cost of running with the WAL on (every commit logs and fsyncs)
-versus off. All runs use a 64-frame buffer pool and a 1,000-key range (small
-enough that the tree itself stays cheap to touch — what's being varied is
-log size, not tree size).
+**What's measured**: recovery time (the constructor's cost reopening a
+database with an existing log) as a function of log size, with and
+without periodic checkpointing, plus the throughput cost of running with
+the WAL on vs off. All runs use a 64-frame buffer pool and a 1,000-key
+range, so what's varying is log size, not tree size.
 
-**Reproduce:**
+**Reproduce**:
 ```sh
 ./build/benchmark/dbengine_bench --benchmark_filter='RecoveryTime|PutThroughput'
 ```
 
-**Results** (4-core sandbox, same caveats as earlier phases):
-
 | Log size (ops) | Recovery, no checkpoint | Recovery, checkpoint every 100 txns |
-|----------------:|------------------------:|--------------------------------------:|
-| 1,000           | 0.44 ms                 | 0.016 ms                              |
-| 5,000           | 1.93 ms                 | 0.015 ms                              |
-| 10,000          | 3.96 ms                 | 0.016 ms                              |
-| 20,000          | 8.93 ms                 | *(not swept — see below)*             |
-| 50,000          | 22.2 ms                 | *(not swept — see below)*             |
+|---|---|---|
+| 1,000 | 0.44 ms | 0.016 ms |
+| 5,000 | 1.93 ms | 0.015 ms |
+| 10,000 | 3.96 ms | 0.016 ms |
+| 20,000 | 8.93 ms | not swept |
+| 50,000 | 22.2 ms | not swept |
 
-*(The checkpointed sweep stops at 10,000 because, unlike the no-checkpoint
-variant, it needs one real commit — and one real fsync — per operation to
-make periodic checkpointing actually trigger; the no-checkpoint variant
-batches all its setup writes into a single transaction/commit precisely to
-avoid that cost and reach larger log sizes. Both are pre-crash setup cost,
-not part of what's timed.)*
+The checkpointed sweep stops at 10,000 because it needs one real
+fsync per operation to trigger periodic checkpointing; the no-checkpoint
+variant batches all setup writes into one commit to reach larger log
+sizes. Both are pre-crash setup cost, not part of what's timed.
 
 | | Ops/sec | Time for 2,000 Puts |
-|---|---:|---:|
+|---|---|---|
 | WAL on (log + fsync every commit) | 9,659/s | 1,519 ms |
 | WAL off | 1,017,820/s | 1.96 ms |
 
-**Takeaways:**
-- **Recovery time scales linearly with log size when there's nothing to
-  bound it** (0.44ms → 22.2ms from 1,000 to 50,000 logged operations, ~50x
-  more log, ~50x more recovery time) — expected, since Redo replays every
-  UPDATE/CLR record from the redo-start point forward.
-- **With periodic checkpoints, recovery time is flat regardless of log
-  size** (0.015-0.016ms across the entire 1,000-10,000 sweep) — this is the
-  headline result this benchmark exists to produce, and getting it required
-  fixing a real bug first (see DESIGN.md): the initial implementation
-  correctly *replayed* only the log since the last checkpoint, but still
-  *located* that checkpoint by scanning the whole log from the start, so
-  recovery time was silently bounded by total log size regardless of how
-  often the engine checkpointed. This benchmark caught that directly — the
-  "with checkpoints" line was scaling linearly too, just like the
-  "without" line, which shouldn't happen if checkpointing is working. The
-  fix (persist the last checkpoint's LSN in the metadata page so recovery
-  can jump straight to it) turned this from a ~100-1400x-too-slow result
-  into the flat line above.
-- **The WAL's throughput cost is dominated by fsync, not logging itself**
-  — a ~105x difference between WAL on and off (9.66k vs. 1.02M ops/s) for
-  identical work, consistent with one fsync call per commit being far more
-  expensive than everything else Put() does combined (tree traversal,
-  in-memory log record construction, the actual insert). This is the
-  expected, textbook cost of the WAL protocol's durability guarantee — a
-  transaction isn't durable until its commit record is fsynced — and the
-  standard mitigation (not implemented here; see DESIGN.md) is group
-  commit: batching multiple transactions' commits into a single fsync so
-  concurrent commits share the cost instead of each paying for their own.
+Takeaways:
+- Recovery time scales linearly with log size when there's nothing to
+  bound it (0.44ms to 22.2ms from 1,000 to 50,000 ops, ~50x more log, ~50x
+  more recovery time). Expected: redo replays every record from the
+  redo-start point forward.
+- With periodic checkpoints, recovery time is flat regardless of log size
+  (0.015-0.016ms across the whole sweep). Getting this required fixing a
+  real bug first: recovery correctly replayed only the log since the last
+  checkpoint, but located that checkpoint by scanning the whole log from
+  the start. This benchmark caught it directly, since the "with
+  checkpoints" line was scaling linearly too. Fix: persist the checkpoint
+  LSN in the metadata page. See DESIGN.md.
+- The WAL's throughput cost is dominated by fsync, not logging itself. A
+  ~105x difference between on and off (9.66k vs 1.02M ops/s) for identical
+  work. This is the expected cost of the durability guarantee. The
+  standard mitigation, not implemented here, is group commit: batching
+  multiple commits into one fsync.
 
-## Phase 5 — MVCC Concurrency
+## Phase 5: MVCC Concurrency
 
-**What's measured:** throughput (autocommit ops/sec) of `MVCCStore` under an
-80% read / 20% write point-workload over 10,000 keys, swept across 1, 2, and
-4 threads (this sandbox's full `nproc`), each thread running its own
-autocommit `SNAPSHOT` transaction per operation. Compared against a
-baseline with identical workload shape and key range, but backed by a plain
-`std::unordered_map` behind a single `std::mutex` held for the whole
-operation — the "obvious" alternative to MVCC for making a shared table
-thread-safe, and what makes MVCC's scaling story legible rather than just a
-number in isolation.
+**What's measured**: throughput of `MVCCStore` under an 80% read / 20%
+write point workload over 10,000 keys, swept across 1, 2, and 4 threads,
+each running its own autocommit `SNAPSHOT` transaction per operation.
+Compared against a baseline with the same workload backed by a plain
+`std::unordered_map` behind one mutex.
 
-**Reproduce:**
+**Reproduce**:
 ```sh
 ./build/benchmark/dbengine_bench --benchmark_filter='MVCCFixture' \
     --benchmark_repetitions=5 --benchmark_report_aggregates_only=true
 ```
 
-**Results** (4-core sandbox; `real_time` mode so wall-clock reflects actual
-parallelism, `cv` up to ~20% at 2 threads — the sandbox's scheduler noise,
-consistent with earlier phases' caveats about shared-CPU environments):
+`real_time` mode so wall-clock reflects actual parallelism. `cv` up to
+~20% at 2 threads, sandbox scheduler noise.
 
 | Threads | MVCC ops/sec | Coarse-lock ops/sec |
-|---:|---:|---:|
+|---|---|---|
 | 1 | 375k/s | 23.8M/s |
 | 2 | 572k/s | 3.20M/s |
 | 4 | 554k/s | 1.39M/s |
 
-**Takeaways:**
-- **MVCC throughput holds roughly flat from 1 to 4 threads; the coarse-lock
-  baseline collapses ~17x over the same range** (23.8M/s → 1.39M/s). This is
-  the headline result this benchmark exists to produce: fine-grained,
-  per-key locking (`MVCCStore`'s `VersionChain` mutexes) lets independent
-  transactions on different keys make progress in parallel, while a single
-  global mutex serializes *every* operation regardless of which keys are
-  touched — the more threads contend for it, the worse it gets.
-- **MVCC's absolute per-operation throughput is far lower than the
-  coarse-lock baseline's** (roughly 60x slower single-threaded). This is
-  expected, not a bug: every autocommit op here pays for a full
-  `Begin`/`Commit` pair — a `Transaction` heap allocation, two atomic
-  counter increments, a transaction-shard mutex acquisition on insert and
-  again on erase, plus the version-chain machinery itself — against a
-  workload that's `unordered_map::find`/`operator[]` for the baseline.
-  MVCC's cost buys transactional semantics (snapshots, isolation levels,
-  atomic multi-key commits) the baseline doesn't have; the fair comparison
-  is the *scaling shape*, not the absolute numbers, which is why this
-  benchmark reports both.
-- **Getting the "holds flat" result required fixing a real bottleneck
-  first.** The initial `MVCCStore` implementation used one
-  `std::unordered_map`+`std::mutex` for the whole active-transaction table.
-  Since every autocommit op does exactly one `Begin` (table insert) and one
-  `Commit` (table erase), that single mutex was contended on nearly every
-  operation regardless of which key it touched — the fine-grained
-  `VersionChain` locking never got a chance to matter. Measured with that
-  version, throughput *fell* from 1 to 4 threads (450k/s → 168k/s) instead
-  of holding steady. The fix — sharding the transaction table into 16
-  independently-locked shards by `txn_id % 16` — is what produces the flat
-  line above; see DESIGN.md for the full story. Same pattern as Phase 3's
-  compaction-starvation bug and Phase 4's checkpoint-scan bug: a benchmark
-  built to demonstrate a property instead caught a bug that was hiding it.
-- **Correctness under concurrency is checked separately, not by this
-  benchmark.** `MVCCStoreTest.ConcurrentIncrementNoLostUpdates`
-  (`test/mvcc/mvcc_store_test.cpp`) runs 4 real threads doing 200
-  read-increment-write-commit cycles each against a shared counter, with
-  retry-on-conflict, and asserts the final value is exactly `threads ×
-  increments` — proving first-committer-wins conflict detection actually
-  prevents lost updates rather than just looking plausible under a
-  throughput benchmark that never checks final state.
+Takeaways:
+- MVCC throughput holds roughly flat from 1 to 4 threads. The coarse-lock
+  baseline collapses ~17x over the same range (23.8M/s to 1.39M/s).
+  Fine-grained per-key locking lets independent transactions on different
+  keys make progress in parallel; a single global mutex serializes every
+  operation regardless of which keys are touched.
+- MVCC's absolute per-operation throughput is far lower than the
+  coarse-lock baseline's, roughly 60x slower single-threaded. Expected,
+  not a bug: every autocommit op here pays for a full `Begin`/`Commit`
+  pair (heap allocation, atomic counters, shard mutex, version-chain
+  machinery) against a workload that's just `unordered_map::find` for the
+  baseline. The fair comparison is scaling shape, not the absolute number.
+- Getting the flat line required fixing a real bottleneck. The initial
+  implementation used one mutex for the whole active-transaction table.
+  Since every autocommit op does one `Begin` and one `Commit` against that
+  table, it was contended on nearly every operation regardless of key.
+  Measured with that version, throughput fell from 1 to 4 threads (450k/s
+  to 168k/s) instead of holding steady. Fix: shard the table into 16
+  independently-locked shards. See DESIGN.md.
+- Correctness under concurrency is checked separately, not by this
+  benchmark. `MVCCStoreTest.ConcurrentIncrementNoLostUpdates` runs 4 real
+  threads doing 200 read-increment-write-commit cycles each against a
+  shared counter, with retry-on-conflict, and asserts the final value is
+  exactly `threads x increments`.
 
-## Phase 6 — SQL Front-End & Tiny Optimizer
+## Phase 6: SQL Front-End & Tiny Optimizer
 
-**What's measured:** the same logical query — "find the one row matching a
-given value" (point) and "find the ~100 rows in a given range" (range) —
-issued two ways against an otherwise-identical `BTREE`-backed table of `id
-INTEGER, tag INTEGER, payload TEXT`, where `id` (the primary key) and `tag`
-hold identical values by construction. `WHERE id = X` / `WHERE id >= X AND
-id < X+100` let the planner pick `POINT_LOOKUP`/`RANGE_SCAN`; `WHERE tag =
-X` / `WHERE tag >= X AND tag < X+100` are logically equivalent (same
-result set, same size) but `tag` isn't the primary key, so the planner has
-no index to use and falls back to `FULL_SCAN` — the only difference
-between each pair is which access path the planner chose. Swept across
-1,000 / 10,000 / 100,000 rows to show how the gap grows with table size.
+**What's measured**: the same logical query issued two ways against an
+identical `BTREE`-backed table, where `id` (the primary key) and `tag`
+hold identical values. `WHERE id = X` lets the planner pick
+`POINT_LOOKUP`/`RANGE_SCAN`; `WHERE tag = X` is logically equivalent but
+`tag` isn't indexed, so the planner falls back to `FULL_SCAN`. Swept
+across 1,000 / 10,000 / 100,000 rows.
 
-**Reproduce:**
+**Reproduce**:
 ```sh
 ./build/benchmark/dbengine_bench --benchmark_filter='PointLookup_.*Predicate|RangeScan_.*Predicate'
 ```
 
-**Results** (4-core sandbox, same caveats as earlier phases):
+| Rows | Point, indexed | Point, unindexed | Slowdown |
+|---|---|---|---|
+| 1,000 | 1.12 us | 51.7 us | 46x |
+| 10,000 | 2.13 us | 869 us | 408x |
+| 100,000 | 3.86 us | 14,444 us | 3,742x |
 
-| Rows | Point, indexed (`id`) | Point, unindexed (`tag`) | Slowdown |
-|---:|---:|---:|---:|
-| 1,000 | 1.12 µs | 51.7 µs | 46x |
-| 10,000 | 2.13 µs | 869 µs | 408x |
-| 100,000 | 3.86 µs | 14,444 µs | 3,742x |
+| Rows | Range, indexed | Range, unindexed | Slowdown |
+|---|---|---|---|
+| 1,000 | 14.4 us | 66.8 us | 4.6x |
+| 10,000 | 19.9 us | 941 us | 47x |
+| 100,000 | 29.6 us | 16,358 us | 553x |
 
-| Rows | Range, indexed (`id`) | Range, unindexed (`tag`) | Slowdown |
-|---:|---:|---:|---:|
-| 1,000 | 14.4 µs | 66.8 µs | 4.6x |
-| 10,000 | 19.9 µs | 941 µs | 47x |
-| 100,000 | 29.6 µs | 16,358 µs | 553x |
+Takeaways:
+- Indexed access paths grow slowly (roughly logarithmic) with table size;
+  unindexed paths grow roughly linear. `POINT_LOOKUP` costs one B+-tree
+  descent regardless of which row; `FULL_SCAN` costs a full pass over
+  every row. At 100,000 rows the gap is ~3,700x for a point query and
+  ~550x for a bounded range, and both ratios are still growing.
+- Both queries in each pair are the same logical request over the same
+  table. Only the column named in `WHERE` differs. `PlanQuery`
+  (`src/sql/planner.cpp`) turns "does this predicate touch the primary
+  key" into which access path to run, and this benchmark confirms that
+  decision is worth orders of magnitude, not a marginal optimization.
+- The range-scan gap is smaller than the point-lookup gap at every row
+  count, expected rather than a discrepancy. `RANGE_SCAN` still pays an
+  O(log n) descent to find its start, same as `POINT_LOOKUP`, but both
+  indexed and unindexed paths then iterate the same ~100-row window,
+  while `POINT_LOOKUP` touches one row and `FULL_SCAN` touches every row.
 
-**Takeaways:**
-- **The indexed access paths grow slowly (roughly logarithmically) with
-  table size; the unindexed ones grow roughly linearly** — exactly the
-  shape the planner's access-path choice predicts. `POINT_LOOKUP` costs one
-  B+-tree descent (`O(log n)`) regardless of which row it's after;
-  `FULL_SCAN` costs a full pass over every row in the table
-  (`O(n)`) even though it's looking for exactly one. At 100,000 rows the
-  gap is already ~3,700x for a point query and ~550x for a bounded range —
-  and both ratios are still growing with `n`, not leveling off.
-- **This is the concrete payoff of Phase 6's planner, not just a
-  restatement of "indexes are faster."** The two queries in each pair are
-  the *same* logical request (same predicate shape, same result set,
-  same table) — the only thing that differs is which column the WHERE
-  clause happens to name. `PlanQuery` (`src/sql/planner.cpp`) is what
-  turns "does this predicate touch the primary key" into "which access
-  path to run," and this benchmark is what confirms that decision matters
-  by orders of magnitude rather than being a marginal optimization.
-- **The range-scan gap is smaller than the point-lookup gap at every row
-  count, which is expected, not a discrepancy.** `RANGE_SCAN` still pays
-  an `O(log n)` B+-tree descent to find its starting key, same as
-  `POINT_LOOKUP` — but then both the indexed and unindexed paths iterate
-  roughly the same ~100-row window, whereas `POINT_LOOKUP` only ever
-  touches one row while `FULL_SCAN` touches every row in the table. The
-  fixed ~100-row scan cost both paths share shrinks the *relative*
-  advantage of indexing without changing its direction.
+## Phase 7: Validation, Differential Testing & TPC-Style Workloads
 
-## Phase 7 — Validation: Differential Testing & TPC-Style Workloads
+**What's measured**:
+- A TPC-C-inspired mixed OLTP transaction (`benchmark/tpcc_bench.cpp`): 1
+  customer lookup, 10x (1 stock lookup + 1 stock update + 1 order-line
+  insert), 1 order insert. 13 SQL statements per "transaction," against a
+  4-warehouse dataset, `BTREE`- and `LSM`-backed.
+- A TPC-H-inspired Q1-style filter (`benchmark/tpch_bench.cpp`): `SELECT
+  l_extendedprice FROM lineitem WHERE l_shipdate <= X` against a
+  300,000-row fact table, swept across selectivity (10% / 50% / 90%).
 
-**What's measured:** (1) a TPC-C-*inspired* mixed OLTP transaction
-(`benchmark/tpcc_bench.cpp`) — 1 customer lookup + 10× (1 stock lookup + 1
-stock update + 1 order-line insert) + 1 order insert, 13 SQL statements
-per "transaction" — against a 4-warehouse / 1,000-customers-per-warehouse
-/ 10,000-items-per-warehouse dataset, `BTREE`- and `LSM`-backed; (2) a
-TPC-H-*inspired* Q1-style filter (`benchmark/tpch_bench.cpp`) — `SELECT
-l_extendedprice FROM lineitem WHERE l_shipdate <= X` — against a 300,000-row
-single-table fact table, swept across selectivity (10% / 50% / 90% of rows
-matching). Neither is compliant with the official TPC-C/TPC-H
-specifications; see DESIGN.md's Phase 7 section for exactly what that would
-require and why this project's SQL layer can't do it yet (no `UPDATE`,
-joins, or aggregates).
+Neither is compliant with the official TPC-C/TPC-H specs. See DESIGN.md
+for what that would require.
 
-**Reproduce:**
+**Reproduce**:
 ```sh
 ./build/benchmark/dbengine_bench --benchmark_filter='TPCC'
 ./build/benchmark/dbengine_bench --benchmark_filter='TPCH'
 ```
 
-**Results** (4-core sandbox, same caveats as earlier phases):
-
 | Engine | Time/transaction | Transactions/sec |
-|---|---:|---:|
-| B+-tree | 90.9 µs | 11,003/s |
-| LSM-tree | 66.4 µs | 15,287/s |
+|---|---|---|
+| B+-tree | 90.9 us | 11,003/s |
+| LSM-tree | 66.4 us | 15,287/s |
 
 | Selectivity | Matched rows (of 300,000) | Query time |
-|---:|---:|---:|
+|---|---|---|
 | 10% | 30,300 | 55.0 ms |
 | 50% | 150,300 | 69.2 ms |
 | 90% | 270,300 | 80.8 ms |
 
-**Takeaways:**
-- **LSM beats B+-tree on the New-Order-style transaction (15,287/s vs.
-  11,003/s, ~1.4x), consistent with Phase 3's head-to-head finding that
-  LSM wins write-heavy workloads.** This transaction is write-dominated —
-  11 of its 13 statements are writes (10 stock/order-line inserts plus 1
-  order insert, against only 2 reads) — exactly the shape Phase 3's
-  benchmark already showed favors the LSM-tree's append-only write path
-  over the B+-tree's in-place page updates. Phase 7 doesn't need a new
-  explanation for this result; it's the same trade-off from Phase 3
-  showing up again through a different, more realistic access pattern.
-- **The TPC-H-style scan's cost grows far more slowly than its result size
-  does: a 9x increase in matched rows (30,300 → 270,300) costs only ~1.5x
-  more time (55.0ms → 80.8ms).** This is the expected, and arguably
-  defining, behavior of a full-table scan with no usable index: cost
-  tracks *table size* (fixed at 300,000 rows here), not *result size*.
-  The small residual growth with selectivity is the extra
-  per-matched-row work (decoding the row, building it into the result
-  set) layered on top of an otherwise-constant per-row scan cost that
-  every one of the 300,000 rows pays regardless of whether it matches.
-  This is the concrete cost a real secondary index (or, for TPC-H
-  specifically, a materialized aggregate) exists to avoid — see DESIGN.md's
-  Deferred list for both.
-- **Together with Phase 6's benchmark, these two results characterize the
-  planner's access-path choice completely for this project's grammar:**
-  Phase 6 showed indexed access paths (`POINT_LOOKUP`/`RANGE_SCAN`) cost
-  is independent of table size and orders of magnitude cheaper than
-  `FULL_SCAN` at the same table size; this phase shows that *within*
-  `FULL_SCAN`, cost is independent of result size and dependent only on
-  table size. Every query this SQL layer can run falls into one of those
-  two regimes.
+Takeaways:
+- LSM beats B+-tree on the New-Order-style transaction (15,287/s vs
+  11,003/s, ~1.4x), consistent with Phase 3's finding that LSM wins
+  write-heavy workloads. 11 of 13 statements in this transaction are
+  writes.
+- The TPC-H-style scan's cost grows far more slowly than its result size.
+  A 9x increase in matched rows (30,300 to 270,300) costs only ~1.5x more
+  time (55.0ms to 80.8ms). Expected for a full-table scan with no usable
+  index: cost tracks table size, not result size.
+- Together with Phase 6, these two results cover the planner's access-path
+  choice completely for this project's grammar. Phase 6 shows indexed
+  access is independent of table size and far cheaper than `FULL_SCAN`
+  at the same size. This phase shows that within `FULL_SCAN`, cost is
+  independent of result size and dependent only on table size.
 
-## Phase 8 — Deployment
+## Phase 8: Deployment
 
-No new benchmark for this phase — it's about making the existing engine
-and its Phase 0-7 results reachable (a published container image, this
-document's headline numbers reflected on a GitHub Pages results page, a
-read-only HTTP front-end over the SQL layer), not adding new
-storage-engine behavior to measure. See DESIGN.md's Phase 8 section for
-what was built and the race condition (`HttpServer::Run()` racing
-`Stop()`) that its test suite — not manual testing — caught.
+No new benchmark for this phase. It's about making the existing engine
+and its results reachable (a published image, a results page, a read-only
+HTTP front-end), not adding storage-engine behavior to measure. See
+DESIGN.md for the race condition (`HttpServer::Run()` vs `Stop()`) its
+test suite caught.
 
-This closes out the project's 8-phase plan: a disk-backed B+-tree and
-LSM-tree behind one `StorageEngine` interface (Phases 2-3), ARIES-style
-crash recovery proven against real `kill -9`s (Phase 4), MVCC snapshot
-isolation with the anomalies it does and doesn't prevent made concretely
-visible (Phase 5), a SQL front-end with a real (if tiny) cost-based
-optimizer (Phase 6), correctness validated against an independent
-implementation and workloads inspired by industry-standard benchmarks
-(Phase 7), and now a way to actually reach any of it without cloning the
-repository and building from source (Phase 8).
+This closes the 8-phase plan:
+- Phases 2-3: a disk-backed B+-tree and LSM-tree behind one interface.
+- Phase 4: ARIES-style crash recovery proven against real `kill -9`s.
+- Phase 5: MVCC snapshot isolation, with the anomalies it does and
+  doesn't prevent made visible.
+- Phase 6: a SQL front-end with a real, tiny cost-based optimizer.
+- Phase 7: correctness validated against an independent implementation
+  and industry-benchmark-inspired workloads.
+- Phase 8: a way to reach any of it without cloning the repo.
