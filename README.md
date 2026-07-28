@@ -42,7 +42,8 @@ No GUI, no hosted instance. This is a systems project, run it locally.
 See [Installation / Setup](#installation--setup) and [Usage](#usage) below
 for the exact steps.
 
-SQL shell:
+### SQL shell
+
 ```
 $ ./build/src/dbengine_cli mydata.db
 db> sql CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)
@@ -55,11 +56,33 @@ id | name | age
 SELECT 1
 ```
 
-Read-only HTTP API:
+![CLI: create table, insert rows, filtered select, delete, verify](docs/screenshots/cli-sql-workflow.png)
+
+### Read-only HTTP API
+
 ```
-$ curl 'http://localhost:8080/query?sql=SELECT%20*%20FROM%20users%20WHERE%20id%20%3D%201'
+$ ./build/src/dbengine_httpd mydata.db.sql 8080 seed.sql &
+$ curl 'http://localhost:8080/query?sql=SELECT%20*%20FROM%20users'
 {"columns":["id","name","age"],"rows":[[1,"alice",30]],"rows_affected":1,"message":"SELECT 1"}
 ```
+
+![HTTP API returning a row as JSON](docs/screenshots/httpd-select-query.png)
+
+### Crash recovery, proven with a real `SIGKILL`
+
+```
+$ ./build/test/dbengine_tests --gtest_filter='CrashRecoveryTest.*' -v
+```
+
+![Crash-injection harness passing against both engines](docs/screenshots/crash-recovery-tests.png)
+
+### The optimizer payoff
+
+```
+$ ./build/benchmark/dbengine_bench --benchmark_filter='PointLookup_.*Predicate'
+```
+
+![Indexed vs unindexed point lookup, same query, same table](docs/screenshots/optimizer-benchmark.png)
 
 ## Features
 
