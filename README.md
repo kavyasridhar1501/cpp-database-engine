@@ -50,6 +50,41 @@ SELECT 1
 
 ![CLI: create table, insert rows, filtered select, delete, verify](docs/screenshots/cli-sql-workflow.png)
 
+### Grammar coverage: multi-condition queries, multiple tables, and clean rejection of unsupported SQL
+
+```sh
+rm -f catalog_demo.db*
+./build/src/dbengine_cli catalog_demo.db <<'EOF'
+sql CREATE TABLE products (id INTEGER, name TEXT, price INTEGER, stock INTEGER)
+sql INSERT INTO products VALUES (1, 'widget', 999, 50)
+sql INSERT INTO products VALUES (2, 'gadget', 1499, 12)
+sql INSERT INTO products VALUES (3, 'gizmo', 799, 0)
+sql INSERT INTO products VALUES (4, 'thingamajig', 2500, 5)
+sql SELECT name, price FROM products
+sql SELECT * FROM products WHERE price > 1000 AND stock > 0
+sql SELECT * FROM products WHERE id >= 2 AND id <= 4
+sql SELECT name FROM products WHERE stock = 0
+sql INSERT INTO products VALUES (1, 'widget-v2', 1099, 45)
+sql SELECT * FROM products WHERE id = 1
+sql DELETE FROM products WHERE stock = 0
+sql SELECT * FROM products
+sql CREATE TABLE orders (id INTEGER, product_id INTEGER, qty INTEGER)
+sql INSERT INTO orders VALUES (1, 2, 3)
+sql SELECT * FROM orders
+sql SELECT * FROM products
+sql SELECT * FROM products, orders WHERE products.id = orders.product_id
+sql SELECT COUNT(*) FROM products
+sql INSERT INTO products VALUES (-1, 'bad', 100, 1)
+exit
+EOF
+```
+
+Column projection, multi-condition `WHERE`, upsert-on-reinsert, range queries,
+and two tables in one database, followed by the grammar's edges (joins,
+aggregates, and a negative primary key) rejected cleanly instead of crashing.
+
+![Multi-condition queries, multiple tables, and the grammar's edges rejected cleanly](docs/screenshots/demo-screenshot.png)
+
 ### Read-only HTTP API
 
 ```
