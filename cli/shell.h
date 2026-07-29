@@ -9,13 +9,9 @@
 
 namespace dbengine {
 
-// Interactive REPL: raw page access (alloc/write/read/stats, from Phase 0)
-// plus a `sql` command (Phase 6) that runs one statement at a time against
-// a Database. The SQL layer deliberately uses a *separate* file
-// (db_path + ".sql") rather than sharing db_path with the raw page
-// commands above — those write directly through DiskManager with no
-// notion of the SQL layer's table-multiplexed key space, so sharing a file
-// would let the two corrupt each other.
+// SQL layer uses a separate file (db_path + ".sql"): raw page commands
+// write through DiskManager with no notion of the SQL table-key space,
+// so sharing a file would let the two corrupt each other.
 class Shell {
  public:
   Shell(DiskManager& disk_manager, std::string db_path) : disk_manager_(disk_manager), db_path_(std::move(db_path)) {}

@@ -271,9 +271,8 @@ SSTable::Iterator SSTable::NewIterator(KeyType start_key) {
   int index = static_cast<int>(std::distance(view->entries, it));
 
   if (index >= view->count) {
-    // start_key falls after this page's last entry but (per MightContain's
-    // range check) not past the table's max key, so the next page must
-    // contain it — see the reasoning in DESIGN.md.
+    // start_key falls after this page's last entry but (per the range check
+    // above) not past the table's max key, so the next page must contain it.
     bpm_->UnpinPage(page_id, false);
     ++page_pos;
     page_id = first_data_page_id_ + page_pos;

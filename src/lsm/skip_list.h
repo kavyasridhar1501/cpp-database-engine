@@ -7,14 +7,9 @@
 
 namespace dbengine {
 
-// An original, header-only skip list (Pugh, "Skip Lists: A Probabilistic
-// Alternative to Balanced Trees", 1990) used as the LSM-tree's memtable.
-// Not thread-safe on its own — the memtable that owns one is protected by
-// the LSM engine's coarse lock, consistent with this project's other
-// data structures (see BufferPoolManager, BPlusTree).
-//
-// Header-only because it's a template, not because it's vendored
-// third-party code — this implementation is original to this project.
+// Header-only skip list (Pugh, 1990) used as the LSM-tree's memtable. Not
+// thread-safe on its own — the owning memtable is protected by the LSM
+// engine's coarse lock.
 template <typename Key, typename Value>
 class SkipList {
  private:

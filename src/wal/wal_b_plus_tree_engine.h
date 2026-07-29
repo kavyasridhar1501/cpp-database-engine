@@ -16,25 +16,19 @@
 namespace dbengine {
 
 // A B+-tree StorageEngine with ARIES-style write-ahead logging and crash
-// recovery layered on top (see DESIGN.md for the full design and its
-// deliberate simplifications). Every operation runs inside a transaction —
-// StorageEngine's Get/Put/Delete/Scan are each their own implicit
+// recovery. StorageEngine's Get/Put/Delete/Scan are each an implicit
 // single-operation transaction; Begin/Put/Delete/Get/Commit/Abort below
-// expose multi-operation transactions explicitly, which is what makes
-// Abort (and crash recovery's Undo phase) actually demonstrate something.
+// expose multi-operation transactions explicitly.
 //
-// Logging is *logical*: an UPDATE record says "Put(key, new_value)" or
-// "Delete(key)" happened, with the prior value attached for undo, rather
-// than a physical byte-image of a page. Redo replays logical operations
-// (idempotent — replaying an already-applied Put/Delete is a no-op change
-// in effect); undo applies the inverse logical operation, writing a
-// Compensation Log Record (CLR) for each step so an undo interrupted by
-// another crash can resume without redoing (or re-undoing) work.
+// Logging is *logical* (an UPDATE record is "Put(key, new_value)" or
+// "Delete(key)" plus the prior value, not a page byte-image). Redo replays
+// logical ops and is idempotent; undo applies the inverse op, writing a
+// Compensation Log Record (CLR) per step so an undo interrupted by another
+// crash can resume without redoing or re-undoing work.
 //
-// Checkpoints are "sharp": DoCheckpoint() flushes every dirty page before
-// recording the checkpoint, trading checkpoint cost for a much simpler
-// recovery algorithm that doesn't need a per-page dirty-page table (see
-// DESIGN.md for why this is a legitimate simplification here).
+// Checkpoints are "sharp": DoCheckpoint() flushes every dirty page first,
+// trading checkpoint cost for not needing a per-page dirty-page table
+// during recovery.
 class WALBPlusTreeEngine : public StorageEngine {
  public:
   explicit WALBPlusTreeEngine(const std::string& db_path, size_t buffer_pool_size,
@@ -52,11 +46,10 @@ class WALBPlusTreeEngine : public StorageEngine {
   std::unique_ptr<StorageIterator> Scan(KeyType start_key) override;
 
   // Explicit multi-operation transactions. Reads see whatever is currently
-  // in the tree (including this or any other transaction's uncommitted
-  // writes) — there's no isolation yet; that's Phase 5's job. What these
-  // provide is atomicity and durability across a crash: either every
-  // operation under a committed txn_id survives recovery, or (if aborted,
-  // or never committed before a crash) none of them do.
+  // in the tree (including any transaction's uncommitted writes) — there's
+  // no isolation. What these provide is atomicity and durability across a
+  // crash: either every operation under a committed txn_id survives
+  // recovery, or none of them do.
   int64_t Begin();
   void Put(int64_t txn_id, KeyType key, const std::string& value);
   bool Delete(int64_t txn_id, KeyType key);
@@ -74,10 +67,9 @@ class WALBPlusTreeEngine : public StorageEngine {
     page_id_t root_page_id;
     // LSN of the most recent *complete* checkpoint's CHECKPOINT_BEGIN
     // record, or -1 if none yet. Lets RecoverOnStartup() jump straight to
-    // the checkpoint instead of scanning the whole log to find it — see
-    // DESIGN.md; without this, recovery time is bounded by total log size
-    // regardless of how often the engine checkpoints, which defeats the
-    // point of checkpointing at all.
+    // the checkpoint instead of scanning the whole log to find it; without
+    // this, recovery time would be bounded by total log size regardless of
+    // checkpoint frequency, defeating the point.
     int64_t last_checkpoint_begin_lsn = -1;
   };
 

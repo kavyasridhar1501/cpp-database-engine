@@ -89,13 +89,10 @@ std::string LSMTreeEngine::MemWALPath(int64_t generation) const {
 }
 
 void LSMTreeEngine::RecoverMemWALOnStartup() {
-  // Discover any generation files a crash left behind. Under normal
-  // operation there's at most one (the currently-active generation); a
-  // crash mid-flush can leave two — the generation being flushed (not yet
-  // deleted, since deletion only happens after the SSTable build succeeds)
-  // and the generation swapped in to replace it. Replaying all of them, in
-  // ascending generation order, reconstructs the exact memtable state at
-  // crash time regardless of which case applies.
+  // A crash mid-flush can leave two generation files (the one being
+  // flushed, since deletion only happens after the SSTable build succeeds,
+  // and the one that replaced it); replaying all found generations in
+  // ascending order reconstructs memtable state at crash time either way.
   std::vector<int64_t> found_generations;
   std::filesystem::path db_path(db_path_);
   std::filesystem::path dir = db_path.parent_path();
@@ -203,10 +200,9 @@ void LSMTreeEngine::FlushActiveMemtable() {
     old = active_memtable_;
     active_memtable_ = std::make_shared<MemTable>();
     if (wal_enabled_) {
-      // Rotate to a fresh generation file *before* releasing the lock, so
-      // any write that lands in the new memtable concurrently with this
-      // flush is logged to the new generation, never the one about to be
-      // retired — see DESIGN.md for the data-loss race this avoids.
+      // Rotate to a fresh generation file *before* releasing the lock, so a
+      // write landing in the new memtable is always logged to the new
+      // generation, never the one about to be retired.
       had_wal = true;
       old_wal_path = MemWALPath(next_wal_generation_ - 1);  // set by the previous rotation/startup
       int64_t new_generation = next_wal_generation_.fetch_add(1);
@@ -251,9 +247,8 @@ void LSMTreeEngine::FlushActiveMemtable() {
   compaction_cv_.notify_one();
 
   if (backlogged) {
-    // The background thread may be starved of lock time by a busy
-    // foreground workload (observed under stress — see DESIGN.md); help it
-    // out inline rather than risking an unbounded tier.
+    // A busy foreground workload can starve the background thread of lock
+    // time; help it out inline rather than risking an unbounded tier.
     CompactOneTierIfNeeded();
   }
 }

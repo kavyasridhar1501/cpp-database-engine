@@ -6,8 +6,7 @@
 
 namespace dbengine {
 
-// A SQL value: either column type this project's tiny SQL layer supports.
-// (See catalog.h's ColumnType, which this must stay in lockstep with.)
+// A SQL value; must stay in lockstep with catalog.h's ColumnType.
 using Value = std::variant<int64_t, std::string>;
 
 enum class ColumnType { INTEGER, TEXT };

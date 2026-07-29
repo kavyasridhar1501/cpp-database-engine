@@ -8,11 +8,8 @@ namespace dbengine {
 class BufferPoolManager;
 
 // An internal (non-leaf) B+-tree node: `size_` (key, child page id) pairs,
-// where entry 0's key is an unused placeholder — value_[0] is "children
-// reachable through this pointer have keys < key_[1]", value_[i] (i>=1) is
-// "keys in [key_[i], key_[i+1])". This is the standard internal-node
-// convention (e.g. CLRS chapter on B-trees, adapted for B+-trees where all
-// data lives in leaves).
+// where entry 0's key is an unused placeholder — value_[0] covers keys <
+// key_[1], value_[i] (i>=1) covers keys in [key_[i], key_[i+1]).
 //
 // Like BPlusTreePage, this is overlaid directly on a Page's byte buffer, so
 // it carries no vtable and `array_` is a fixed-size C array sized to fill

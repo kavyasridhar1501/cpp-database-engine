@@ -18,12 +18,9 @@ std::string TempDbPath(const std::string& label) {
   return (std::filesystem::temp_directory_path() / ("dbengine_sql_bench_" + label + ".sql.db")).string();
 }
 
-// `id` is the primary key (0..n-1, indexed by construction — every
-// StorageEngine key is this column); `tag` holds the identical values but
-// isn't indexed by anything, so a predicate on it forces the planner's
-// FULL_SCAN path. That makes "WHERE id = X" and "WHERE tag = X" return the
-// exact same single row — the only difference this benchmark measures is
-// the access path the planner picked to find it.
+// `tag` holds values identical to the `id` primary key but isn't indexed, so
+// a predicate on it forces FULL_SCAN — "WHERE id = X" and "WHERE tag = X"
+// return the same row via different access paths.
 Database& GetOrBuildDatabase(int64_t n) {
   static std::unordered_map<int64_t, std::unique_ptr<Database>> cache;
   auto it = cache.find(n);
@@ -42,8 +39,7 @@ Database& GetOrBuildDatabase(int64_t n) {
   return ref;
 }
 
-// Indexed access: the planner sees "id = X" (the primary key) and picks
-// POINT_LOOKUP — one StorageEngine::Get() regardless of table size.
+// Indexed access: planner picks POINT_LOOKUP, cost independent of table size.
 void BM_PointLookup_IndexedPredicate(benchmark::State& state) {
   int64_t n = state.range(0);
   Database& db = GetOrBuildDatabase(n);
@@ -63,12 +59,8 @@ BENCHMARK(BM_PointLookup_IndexedPredicate)
     ->Arg(100000)
     ->Unit(benchmark::kMicrosecond);
 
-// Same query shape, same single-row result, but on a column the planner
-// has no index for — FULL_SCAN, so cost grows with table size instead of
-// staying flat. This is the comparison that makes the "tiny optimizer"
-// concrete: it's not just that POINT_LOOKUP is fast, it's that picking the
-// wrong access path for the same logical query gets proportionally worse
-// as the table grows.
+// Same query shape and result, but on an unindexed column — FULL_SCAN, so
+// cost grows with table size instead of staying flat.
 void BM_PointLookup_UnindexedPredicate(benchmark::State& state) {
   int64_t n = state.range(0);
   Database& db = GetOrBuildDatabase(n);
@@ -88,11 +80,8 @@ BENCHMARK(BM_PointLookup_UnindexedPredicate)
     ->Arg(100000)
     ->Unit(benchmark::kMicrosecond);
 
-// A bounded range on the primary key (RANGE_SCAN) versus the same
-// selectivity forced into a FULL_SCAN by putting the bound on `tag`
-// instead — RANGE_SCAN should cost roughly the fixed ~100-row window
-// regardless of n, while the unindexed version still pays for the whole
-// table.
+// Bounded range on the primary key (RANGE_SCAN): cost should stay roughly
+// the fixed ~100-row window regardless of n.
 void BM_RangeScan_IndexedPredicate(benchmark::State& state) {
   int64_t n = state.range(0);
   Database& db = GetOrBuildDatabase(n);

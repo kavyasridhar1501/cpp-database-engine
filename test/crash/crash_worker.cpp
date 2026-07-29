@@ -1,11 +1,7 @@
-// Standalone worker for the crash-injection harness (see
-// crash_recovery_test.cpp). Repeatedly commits (and, for the B+-tree,
-// occasionally aborts) transactions in a tight loop with no artificial
-// delay, so an external SIGKILL lands at a genuinely random point in the
-// operation sequence. Every confirmed commit is recorded to a separate,
-// independently-fsynced side-effect log *after* the engine call returns,
-// so the harness has an oracle for "what was actually durable" that
-// doesn't depend on the (possibly killed) engine itself.
+// Crash-injection worker (see crash_recovery_test.cpp): loops committing
+// transactions with no delay so an external SIGKILL lands at a random
+// point, recording each confirmed commit to a separately fsynced side-log
+// as a durability oracle independent of the (possibly killed) engine.
 //
 // Usage: dbengine_crash_worker <bplustree|lsm> <db_path> <side_log_path> <key_range>
 
@@ -21,13 +17,10 @@
 
 namespace {
 
-// Writes one bracketing line ('A'ttempt before the engine call, 'C'onfirm
-// after it returns) rather than a single post-hoc record. A kill can land
-// between the engine call returning and this line reaching disk, so a bare
-// post-hoc log has an inherent race — the DB can legitimately be one write
-// ahead of it. Bracketing turns that into a detectable "dangling A with no
-// matching C" at the tail of the log instead of an unexplained mismatch;
-// see crash_recovery_test.cpp's verifier for how it's used.
+// Writes bracketing 'A'ttempt/'C'onfirm lines rather than a single post-hoc
+// record: a kill between the engine call returning and the log write would
+// otherwise be an undetectable race. A dangling A with no C at the tail is
+// the expected signature instead of an unexplained mismatch.
 void AppendSideLogLine(FILE* side_log, char marker, int64_t key, const std::string& value) {
   fprintf(side_log, "%c %lld %s\n", marker, static_cast<long long>(key), value.c_str());
   fflush(side_log);

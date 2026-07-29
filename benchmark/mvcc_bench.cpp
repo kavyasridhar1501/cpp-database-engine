@@ -14,18 +14,12 @@ using dbengine::IsolationLevel;
 using dbengine::KeyType;
 using dbengine::MVCCStore;
 
-// Large relative to the thread counts swept below so write-write conflicts
-// stay rare — this benchmark is about synchronization overhead as threads
-// scale, not about conflict-retry cost (that's exercised deliberately by
-// MVCCStoreTest.ConcurrentIncrementNoLostUpdates instead).
+// Large relative to swept thread counts so write-write conflicts stay rare:
+// this measures synchronization overhead, not conflict-retry cost.
 constexpr int64_t kKeyRange = 10000;
 
-// Shared fixture so every thread in a given ->Threads(N) configuration
-// operates on the *same* store/map. Google Benchmark instantiates one
-// Fixture object per thread, so the actual shared state has to be a static
-// member, created/destroyed only by thread_index==0 — Benchmark places a
-// barrier around SetUp/TearDown so this is race-free (see Google
-// Benchmark's own multithreaded-fixture examples).
+// Google Benchmark instantiates one Fixture per thread, so shared state must
+// be a static member, created/destroyed only by thread_index==0.
 class MVCCFixture : public benchmark::Fixture {
  public:
   void SetUp(benchmark::State& state) override {
@@ -53,10 +47,7 @@ std::unordered_map<KeyType, std::string> MVCCFixture::coarse_map_;
 std::mutex MVCCFixture::coarse_map_mutex_;
 
 // 80% point reads / 20% point writes, each its own autocommit SNAPSHOT
-// transaction, uniform over kKeyRange keys. Version chains never get long
-// enough to matter here (kKeyRange is large, so a given key is revisited
-// rarely within one run), so this measures MVCC's per-op synchronization
-// cost as thread count grows, not chain-scan cost.
+// transaction. Measures MVCC's per-op synchronization cost as thread count grows.
 BENCHMARK_DEFINE_F(MVCCFixture, ReadWriteMix)(benchmark::State& state) {
   std::mt19937 rng(static_cast<unsigned>(state.thread_index()) + 1);
   std::uniform_int_distribution<int64_t> key_dist(0, kKeyRange - 1);
@@ -82,12 +73,9 @@ BENCHMARK_REGISTER_F(MVCCFixture, ReadWriteMix)
     ->UseRealTime()
     ->Unit(benchmark::kMicrosecond);
 
-// Same 80/20 read/write mix and key range, but against a single
-// std::unordered_map behind one std::mutex held for the whole operation —
-// the "obvious" alternative to MVCC for making a table thread-safe. This is
-// the baseline that makes MVCC's scaling advantage legible: it should stay
-// roughly flat (or degrade) as threads increase, since every op serializes
-// on the one lock regardless of which keys are touched.
+// Same 80/20 mix against a single std::unordered_map behind one mutex, as a
+// baseline: should stay flat or degrade as threads increase since every op
+// serializes on the one lock.
 BENCHMARK_DEFINE_F(MVCCFixture, CoarseLockReadWriteMix)(benchmark::State& state) {
   std::mt19937 rng(static_cast<unsigned>(state.thread_index()) + 1);
   std::uniform_int_distribution<int64_t> key_dist(0, kKeyRange - 1);

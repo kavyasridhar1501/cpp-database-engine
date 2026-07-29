@@ -11,22 +11,16 @@
 
 namespace dbengine {
 
-// An append-only, page-based write-ahead log. Records are packed into
-// fixed-size pages (like LeafPage/SSTable data pages — every LogRecord is
-// the same size, so no slotted/variable-length framing is needed) in a
-// dedicated file, always starting at page 0, so a record's LSN maps
-// directly to its (page, index) by simple division — no separate index
-// structure needed to support random-access ReadRecord(lsn), which
-// recovery's undo phase relies on to walk a transaction's prev_lsn chain
-// backward.
+// An append-only, page-based write-ahead log. Every LogRecord is fixed-size
+// and pages start at page 0, so a record's LSN maps directly to its (page,
+// index) by division — no separate index needed for random-access
+// ReadRecord(lsn), which recovery's undo phase uses to walk a transaction's
+// prev_lsn chain backward.
 //
-// Append() writes the record's page via DiskManager (a pwrite — durable
-// against this process being killed, since the write lands in the OS page
-// cache regardless of fsync; see DESIGN.md). Flush() additionally fsyncs,
-// which is what's needed for durability against a *power loss/OS crash*
-// rather than just this process dying — the golden rule this project
-// enforces is "a transaction's COMMIT record (and everything before it) is
-// fsynced before Commit() returns to the caller."
+// Append() only pwrites (survives process death via the OS page cache, not
+// power loss). Flush() fsyncs — required before Commit() returns, so a
+// transaction's COMMIT record (and everything before it) is durable against
+// an actual crash.
 class LogManager {
  public:
   explicit LogManager(const std::string& log_path);

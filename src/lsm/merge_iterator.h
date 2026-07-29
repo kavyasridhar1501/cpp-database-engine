@@ -12,16 +12,14 @@ namespace dbengine {
 
 // K-way merge over a set of sorted cursors (a memtable and/or SSTables),
 // producing one entry per distinct key in ascending order — including
-// tombstones, since what to do with a tombstone (drop it, or keep it to
-// keep shadowing older data) is a decision only the caller can make (see
-// LSMTreeEngine::Scan, which filters them out, versus compaction, which
-// keeps them unless it's compacting the bottommost tier).
+// tombstones, since dropping vs. keeping one is a decision only the caller
+// can make (LSMTreeEngine::Scan filters them; compaction keeps them unless
+// compacting the bottommost tier).
 //
 // `cursors` must be given in priority order, highest first: index 0 wins
-// any tie. LSMTreeEngine builds this list as [memtable, tier0 newest..
-// oldest, tier1 newest..oldest, ...] for Scan, matching the same
-// precedence Get() uses, and as [tier newest..oldest] for a single tier's
-// compaction merge.
+// any tie. LSMTreeEngine builds this as [memtable, tier0 newest..oldest,
+// tier1 newest..oldest, ...] for Scan, and [tier newest..oldest] for a
+// single tier's compaction merge.
 class LSMMergeIterator {
  public:
   explicit LSMMergeIterator(std::vector<std::unique_ptr<LSMCursor>> cursors);

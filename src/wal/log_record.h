@@ -22,19 +22,14 @@ enum class LogRecordType : int32_t {
 
 enum class LogOpType : int32_t { NONE = 0, PUT = 1, DELETE = 2 };
 
-// A single WAL record. This project logs *logically* — an UPDATE record
-// says "Put(key, new_value)" or "Delete(key)" happened, with enough of the
-// prior state to undo it, rather than a physical before/after byte image of
-// a page. See DESIGN.md for why: it keeps every record small and fixed-size
-// (no slotted-page log format needed) and is exactly the technique the
-// ARIES paper itself prescribes for tree-structured indexes, where a
-// physical undo doesn't make sense once a split or merge has changed the
-// page layout since the original operation.
+// A single WAL record, logged *logically* ("Put(key, new_value)" happened,
+// with enough prior state to undo it) rather than as a physical page
+// byte-image — ARIES's prescribed approach for tree-structured indexes,
+// where physical undo breaks once a split/merge has changed the page layout.
 //
-// One struct covers every record type (a tagged union in spirit); fields
-// irrelevant to a given `type` are simply unused. This keeps LogManager's
-// on-disk page format uniform (a fixed-size array of LogRecord, like
-// LeafPage/SSTable data pages) rather than needing variable-length framing.
+// One struct covers every record type (a tagged union in spirit) so
+// LogManager's on-disk page format stays a uniform fixed-size array, with
+// no variable-length framing.
 struct LogRecord {
   int64_t lsn = -1;
   int64_t txn_id = -1;

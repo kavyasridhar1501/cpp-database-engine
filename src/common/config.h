@@ -24,9 +24,8 @@ inline constexpr KeyType INVALID_KEY = std::numeric_limits<KeyType>::min();
 
 // Values are caller-provided byte strings capped at MAX_VALUE_SIZE. The cap
 // is enforced by both storage engines (not just the B+-tree, which needs it
-// for its fixed-size leaf slots) so that head-to-head comparisons between
-// them stay apples-to-apples; see DESIGN.md for the trade-off this forces on
-// the B+-tree versus what the LSM-tree could otherwise support for free.
+// for its fixed-size leaf slots) so head-to-head comparisons stay
+// apples-to-apples.
 inline constexpr size_t MAX_VALUE_SIZE = 64;
 
 }  // namespace dbengine

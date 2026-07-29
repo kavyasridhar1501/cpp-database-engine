@@ -30,8 +30,8 @@ class DiskManager {
   void ReadPage(page_id_t page_id, char* page_data);
 
   // Writes PAGE_SIZE bytes from `page_data` to `page_id`, extending the file
-  // if necessary. Does not implicitly fsync; call FlushPage or Sync for
-  // durability guarantees (relevant once the WAL lands in Phase 4).
+  // if necessary. Does not implicitly fsync; call Sync for durability
+  // guarantees.
   void WritePage(page_id_t page_id, const char* page_data);
 
   // fsyncs the underlying file descriptor.

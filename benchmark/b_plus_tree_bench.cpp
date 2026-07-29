@@ -15,10 +15,8 @@ namespace {
 using dbengine::BPlusTreeEngine;
 using dbengine::KeyType;
 
-// Deliberately smaller than either dataset (1M keys is ~76MB of pages, 10M
-// is ~760MB) so lookups mostly miss the buffer pool and hit real page I/O —
-// the realistic case for an index that doesn't fully fit in memory, and the
-// harder case worth measuring.
+// Deliberately smaller than either dataset so lookups mostly miss the buffer
+// pool and hit real page I/O.
 constexpr size_t kBufferPoolFrames = 2000;
 
 std::string TempDbPath(const std::string& label) {
@@ -27,10 +25,8 @@ std::string TempDbPath(const std::string& label) {
 
 std::string ValueFor(KeyType key) { return "v" + std::to_string(key); }
 
-// Random (not sequential) insertion order: the harder case for a B+-tree
-// (splits occur throughout the key space rather than always at the
-// rightmost leaf) and the fairer baseline for the Phase 3 head-to-head
-// against an LSM-tree, whose write path is insensitive to key order.
+// Random insertion order: the harder case for a B+-tree (splits occur
+// throughout the key space, not just at the rightmost leaf).
 std::vector<KeyType> BuildShuffledKeys(int64_t n, unsigned seed) {
   std::vector<KeyType> keys(static_cast<size_t>(n));
   std::iota(keys.begin(), keys.end(), 0);
@@ -39,10 +35,8 @@ std::vector<KeyType> BuildShuffledKeys(int64_t n, unsigned seed) {
   return keys;
 }
 
-// Lazily builds (once per key count, shared across benchmark functions and
-// across Google Benchmark's internal calibration reps) a B+-tree with `n`
-// keys inserted in random order, so BM_PointLookup and BM_RangeScan pay the
-// ~1M/~10M-key construction cost only once each.
+// Builds the tree once per key count and caches it so BM_PointLookup and
+// BM_RangeScan don't pay construction cost per iteration.
 BPlusTreeEngine& GetOrBuildEngine(int64_t n) {
   static std::unordered_map<int64_t, std::unique_ptr<BPlusTreeEngine>> cache;
   auto it = cache.find(n);
@@ -100,10 +94,7 @@ void BM_RangeScan(benchmark::State& state) {
 }
 BENCHMARK(BM_RangeScan)->Arg(1000000)->Arg(10000000)->Unit(benchmark::kMicrosecond);
 
-// Single-shot (->Iterations(1)): times building an N-key tree from an empty
-// file via random-order inserts, so the reported items_per_second is insert
-// throughput for populating a fresh index, not steady-state upsert cost
-// into an already-built one.
+// Insert throughput for populating a fresh index (not steady-state upsert cost).
 void BM_InsertThroughput(benchmark::State& state) {
   int64_t n = state.range(0);
   std::string path = TempDbPath("insert_" + std::to_string(n));

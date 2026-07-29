@@ -164,11 +164,7 @@ TEST_F(WALBPlusTreeEngineTest, WalDisabledStillSupportsAbortViaInMemoryUndo) {
   EXPECT_EQ(value, "original");
 }
 
-// Simulates a crash in-process: destroy the engine with a transaction still
-// active (never committed or aborted — exactly what a `kill -9` would leave
-// behind), then reopen the same files and verify recovery reconstructs the
-// correct state: every committed transaction's effects present, the
-// never-committed one's effects entirely absent.
+// Destroys the engine with a transaction still active, simulating `kill -9`.
 TEST_F(WALBPlusTreeEngineTest, RecoveryRollsBackTransactionNeverCommittedBeforeCrash) {
   {
     WALBPlusTreeEngine engine(file_path_, 16);
@@ -234,10 +230,6 @@ TEST_F(WALBPlusTreeEngineTest, RecoveryAfterCheckpointOnlyReplaysSinceCheckpoint
   }
 }
 
-// The core correctness deliverable: randomized transactions (mix of commit
-// and abort) validated against a std::map oracle, then a simulated crash
-// (destroy with one final transaction left dangling) and a fresh reopen to
-// confirm recovery reconstructs exactly the oracle's committed state.
 TEST_F(WALBPlusTreeEngineTest, RandomizedTransactionsMatchOracleAcrossSimulatedCrash) {
   constexpr int kNumTxns = 500;
   constexpr int kKeyRange = 100;

@@ -20,16 +20,13 @@ class StorageIterator {
   virtual std::string GetValue() const = 0;
 };
 
-// The interface every storage engine (disk-backed B+-tree in Phase 2,
-// LSM-tree in Phase 3) implements identically, so the rest of the system —
-// benchmarks, later the SQL layer — never needs to know which one it's
+// The interface every storage engine (disk-backed B+-tree, LSM-tree)
+// implements identically, so callers never need to know which one they're
 // talking to.
 //
 // Keys are fixed-size 64-bit integers (KeyType) and unique per engine; Put
-// on an existing key overwrites its value (upsert semantics, not
-// insert-or-fail). Values are byte strings capped at MAX_VALUE_SIZE across
-// both engines — see common/config.h for why that cap exists even though
-// only the B+-tree strictly needs it.
+// on an existing key overwrites its value (upsert, not insert-or-fail).
+// Values are byte strings capped at MAX_VALUE_SIZE.
 class StorageEngine {
  public:
   virtual ~StorageEngine() = default;

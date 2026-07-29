@@ -238,8 +238,7 @@ void WALBPlusTreeEngine::Commit(int64_t txn_id) {
     rec.type = LogRecordType::COMMIT;
     rec.prev_lsn = it->second.last_lsn;
     log_manager_->Append(rec);
-    // The golden rule this project enforces: a transaction's COMMIT record
-    // is fsynced before Commit() returns to the caller.
+    // COMMIT must be fsynced before Commit() returns to the caller.
     log_manager_->Flush();
   }
   active_txns_.erase(it);
@@ -316,9 +315,8 @@ void WALBPlusTreeEngine::Abort(int64_t txn_id) {
 
 void WALBPlusTreeEngine::DoCheckpoint() {
   // Sharp checkpoint: flush every dirty page first, so the only updates not
-  // yet reflected on disk are exactly the ones belonging to transactions
-  // still active right now (recorded below) — see DESIGN.md for why this
-  // avoids needing a per-page dirty-page table during recovery.
+  // yet on disk belong to transactions still active right now (recorded
+  // below) — avoids needing a per-page dirty-page table during recovery.
   bpm_->FlushAllPages();
 
   LogRecord begin_rec;
@@ -339,10 +337,8 @@ void WALBPlusTreeEngine::DoCheckpoint() {
 
   log_manager_->Flush();
 
-  // Record where this checkpoint starts so a future recovery can jump
-  // straight to it instead of scanning the whole log to find it — without
-  // this, recovery time would be bounded by total log size regardless of
-  // how often the engine checkpoints, defeating the point.
+  // Record where this checkpoint starts so recovery can jump straight to it
+  // instead of scanning the whole log.
   Page* meta = bpm_->FetchPage(kMetaPageId);
   reinterpret_cast<MetaPage*>(meta->GetData())->last_checkpoint_begin_lsn = begin_lsn;
   bpm_->UnpinPage(kMetaPageId, true);
@@ -361,13 +357,11 @@ void WALBPlusTreeEngine::RecoverOnStartup() {
     return;  // empty log.
   }
 
-  // Fast path: jump straight to the last checkpoint via the meta page's
-  // pointer (see DoCheckpoint()) instead of scanning the whole log to find
-  // it. Its bracket (CHECKPOINT_BEGIN, a handful of ACTIVE_TXN records,
-  // CHECKPOINT_END) is small and read directly by LSN; only records from
-  // the resulting redo_start_lsn onward are ever read via ReadFrom(),
-  // which is what makes recovery time track log-since-checkpoint rather
-  // than total log size.
+  // Jump straight to the last checkpoint via the meta page's pointer; its
+  // bracket (CHECKPOINT_BEGIN, ACTIVE_TXN records, CHECKPOINT_END) is read
+  // directly by LSN, and only records from the resulting redo_start_lsn
+  // onward are read via ReadFrom() — recovery time tracks log-since-
+  // checkpoint, not total log size.
   int64_t redo_start_lsn = 0;
   std::vector<std::pair<int64_t, int64_t>> checkpoint_active_txns;
   {
@@ -448,12 +442,10 @@ void WALBPlusTreeEngine::RecoverOnStartup() {
     }
   }
 
-  // UNDO: roll back every loser transaction. Each transaction's own
-  // prev_lsn/undo_next_lsn chain is independent of the others' (this is
-  // logical, key-level undo, not physical page-level undo), so processing
-  // losers one at a time — rather than ARIES's globally LSN-interleaved
-  // order, which matters for physical page latching this project doesn't
-  // do — is still correct here.
+  // UNDO: roll back every loser transaction. Each transaction's undo chain
+  // is independent (logical, key-level undo, not physical page-level undo),
+  // so processing losers one at a time is correct here, unlike ARIES's
+  // globally LSN-interleaved order which matters for page latching.
   for (const auto& [txn_id, last_lsn] : active) {
     UndoTransactionFromLog(txn_id, last_lsn);
   }

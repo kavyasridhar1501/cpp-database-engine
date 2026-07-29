@@ -120,10 +120,6 @@ TEST_F(BufferPoolManagerTest, FlushPageWritesDirtyDataAndClearsDirtyFlag) {
   EXPECT_EQ(buf, expected);
 }
 
-// Randomized stress test: a pool much smaller than the working set forces
-// continuous eviction churn. Every mutation is recorded in an in-memory
-// oracle map and periodically re-verified via FetchPage, so any write-back
-// or frame-reuse bug would show up as a mismatch.
 TEST_F(BufferPoolManagerTest, RandomAccessStressTestForcesEvictionAndPreservesData) {
   constexpr size_t kPoolSize = 8;
   constexpr int kNumPages = 100;

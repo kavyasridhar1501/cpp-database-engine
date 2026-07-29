@@ -16,14 +16,10 @@ namespace dbengine {
 // Fixed-frame buffer pool sitting between callers and DiskManager. Pages are
 // pinned while in use (FetchPage/NewPage bump the pin count; UnpinPage drops
 // it) and only become eviction candidates once their pin count reaches zero.
-// Eviction policy is pluggable via Replacer (see lru_k_replacer.h for the
-// production policy and lru_replacer.h for the plain-LRU comparison
-// baseline used in the Phase 1 benchmark).
+// Eviction policy is pluggable via Replacer (lru_k_replacer.h is the
+// production policy; lru_replacer.h is a plain-LRU comparison baseline).
 //
-// All public methods take a single mutex; this project prioritizes a
-// correct, simple implementation now over fine-grained per-page latching,
-// which can be revisited once profiling under MVCC (Phase 5) says it's
-// worth it.
+// All public methods take a single mutex rather than per-page latching.
 class BufferPoolManager {
  public:
   BufferPoolManager(size_t pool_size, DiskManager* disk_manager,

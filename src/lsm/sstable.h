@@ -16,17 +16,14 @@ namespace dbengine {
 
 // An immutable, sorted, page-based run of (key, LSMValue) entries, written
 // once (by a memtable flush or a compaction merge) and never modified. Each
-// SSTable owns its own file (its own DiskManager) and a small dedicated
-// BufferPoolManager for caching data-page reads; its sparse index and Bloom
-// filter are loaded fully into memory on Open() since they're small and
-// consulted on every lookup.
+// SSTable owns its own file and a small BufferPoolManager for caching
+// data-page reads; its sparse index and Bloom filter are loaded fully into
+// memory on Open().
 //
 // Lifetime is managed via shared_ptr: a compaction that supersedes an
 // SSTable calls MarkObsolete() and drops the engine's reference, but any
-// reader that grabbed a shared_ptr before the swap keeps the object (and
-// its underlying file) alive until it's done — the destructor deletes the
-// file only if MarkObsolete() was called, since by construction it only
-// runs once every reference is gone.
+// reader holding a shared_ptr keeps the object (and its file) alive until
+// done — the destructor deletes the file only if MarkObsolete() was called.
 class SSTable {
  public:
   ~SSTable();

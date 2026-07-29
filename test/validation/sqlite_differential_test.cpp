@@ -1,25 +1,10 @@
-// Differential testing (Phase 7): the same SQL statement text, executed
-// against both this project's Database and a real SQLite, must produce the
-// same results. This project's tiny grammar (src/sql/parser.h) is a strict
-// subset of real SQL — CREATE TABLE/INSERT/SELECT/DELETE with an
-// AND-conjunction WHERE all parse and mean the same thing in SQLite — so no
-// translation layer is needed, and any mismatch is either a genuine bug or
-// one of this project's documented, deliberate scope limitations (see the
-// negative-primary-key and MAX_VALUE_SIZE guards below, both of which the
-// generators here simply avoid rather than asserting SQLite is "wrong").
-//
-// One real semantic gap this file *does* bridge: this project's grammar
-// has no PRIMARY KEY / uniqueness syntax at all — column[0] is *always*
-// treated as the primary key implicitly, and every StorageEngine::Put is
-// an upsert (see DESIGN.md's Phase 6 section). Bare `id INTEGER` in
-// standard SQL is just a plain column with no special uniqueness — SQLite
-// happily stores multiple rows with the same "id" unless told otherwise —
-// so CREATE TABLE and INSERT text sent to SQLite is adjusted (first
-// column gets "PRIMARY KEY", INSERT becomes "INSERT OR REPLACE") to match
-// what this project's grammar means unconditionally. This isn't a
-// translation layer for the *language* (still identical syntax otherwise)
-// — it's making the two sides agree on what "the same schema" means before
-// asking whether they compute the same answer.
+// Differential testing: the same SQL statement text, run against both
+// Database and a real SQLite, must produce the same results. Our grammar
+// has no PRIMARY KEY/uniqueness syntax — column[0] is always the implicit
+// primary key and every Put is an upsert — so CREATE TABLE/INSERT text sent
+// to SQLite is adjusted (first column gets PRIMARY KEY, INSERT becomes
+// INSERT OR REPLACE) to make the two sides agree on schema semantics before
+// comparing results.
 
 #include <gtest/gtest.h>
 
@@ -64,21 +49,16 @@ class SqliteDifferentialTest : public ::testing::TestWithParam<EngineType> {
   std::string file_path_;
 };
 
-// This project's grammar requires column[0] to be INTEGER and always
-// treats it as the primary key; plain "INTEGER" in real SQL carries no
-// such meaning. Rewrites the *first* INTEGER (always the primary key
-// column's type, by this grammar's own rule) to "INTEGER PRIMARY KEY" so
-// SQLite enforces the same one-row-per-key invariant this project's
-// StorageEngine::Put always has.
+// Rewrites the first INTEGER (the implicit primary key column) to
+// "INTEGER PRIMARY KEY" so SQLite enforces the same one-row-per-key
+// invariant Put() always has.
 std::string SqliteCreateTable(const std::string& our_create) {
   size_t pos = our_create.find("INTEGER");
   return our_create.substr(0, pos) + "INTEGER PRIMARY KEY" +
          our_create.substr(pos + std::string("INTEGER").size());
 }
 
-// Put() is an upsert; plain SQLite INSERT is not (it errors on a duplicate
-// primary key). "INSERT OR REPLACE" is SQLite's upsert-by-primary-key form
-// — the direct match for this project's semantics.
+// Put() is an upsert; SQLite's INSERT OR REPLACE matches that semantics.
 std::string SqliteInsert(const std::string& our_insert) {
   return "INSERT OR REPLACE" + our_insert.substr(std::string("INSERT").size());
 }
@@ -187,12 +167,8 @@ TEST_P(SqliteDifferentialTest, DeleteRowCountMatchesSqlite) {
   ExpectSameRows(db.Execute("SELECT * FROM t"), sqlite.Query("SELECT * FROM t"));
 }
 
-// The main fuzzer: a long randomized sequence of INSERT/DELETE/SELECT over
-// a small key range, applying the *identical* generated statement text to
-// both engines and checking every SELECT along the way. Primary keys are
-// generated non-negative (this project's rule, not SQL's) and TEXT payloads
-// stay well under MAX_VALUE_SIZE — both documented Phase 6 scope limits,
-// not things this test is trying to catch SQLite disagreeing on.
+// Keys stay non-negative and values stay under MAX_VALUE_SIZE — deliberate
+// scope limits this test avoids, not things it's checking SQLite against.
 TEST_P(SqliteDifferentialTest, RandomizedInsertDeleteSelectMatchesSqlite) {
   Database db = MakeDatabase();
   SqliteReference sqlite;

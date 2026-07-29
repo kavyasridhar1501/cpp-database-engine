@@ -13,10 +13,8 @@ namespace {
 using dbengine::Database;
 using dbengine::EngineType;
 
-// Deliberately small relative to a real TPC-C run (whose smallest official
-// configuration is still tens of warehouses with thousands of customers
-// and items each) — enough to exercise a multi-table, ID-arithmetic OLTP
-// access pattern without needing minutes of setup time to populate.
+// Deliberately small relative to a real TPC-C run, enough to exercise a
+// multi-table OLTP access pattern without minutes of setup time.
 constexpr int64_t kNumWarehouses = 4;
 constexpr int64_t kCustomersPerWarehouse = 1000;
 constexpr int64_t kItemsPerWarehouse = 10000;
@@ -26,11 +24,9 @@ std::string TempDbPath(const std::string& label) {
   return (std::filesystem::temp_directory_path() / ("dbengine_tpcc_bench_" + label + ".sql.db")).string();
 }
 
-// TPC-C's schema uses composite keys (warehouse_id, local_id); this
-// project's SQL layer only ever indexes a single INTEGER column per table
-// (see DESIGN.md's Phase 6 section), so both are flattened into one
-// primary key by arithmetic — the standard workaround on any engine
-// without composite-key support.
+// TPC-C's schema uses composite keys (warehouse_id, local_id); this SQL
+// layer only indexes a single INTEGER column, so both are flattened into
+// one primary key by arithmetic.
 int64_t CustomerId(int64_t w_id, int64_t local_id) { return w_id * kCustomersPerWarehouse + local_id; }
 int64_t StockId(int64_t w_id, int64_t item_id) { return w_id * kItemsPerWarehouse + item_id; }
 
@@ -67,17 +63,11 @@ Database& GetOrBuildDatabase(EngineType engine_type) {
   return ref;
 }
 
-// One TPC-C-style "New-Order" transaction (simplified — see DESIGN.md's
-// Phase 7 section for exactly what's cut relative to the official spec):
-// look up the placing customer, then for each order line look up and
-// decrement the relevant stock row (an upsert-as-update — this project's
-// storage model, see DESIGN.md's Phase 6 section) and insert an
-// order_line row, finishing with one orders row insert. Not wrapped in an
-// actual multi-statement transaction — Phases 4/5 built that machinery for
-// the disk engines and MVCCStore respectively, but the SQL layer itself
-// doesn't expose Begin/Commit yet (see DESIGN.md's Phase 6 deferred list)
-// — so this measures the SQL layer's raw statement throughput under a
-// TPC-C-shaped access pattern, not transactional/atomicity cost.
+// Simplified TPC-C-style "New-Order" transaction: look up the customer,
+// then for each order line look up/decrement stock and insert an
+// order_line row, finishing with one orders insert. Not wrapped in an
+// actual transaction — the SQL layer doesn't expose Begin/Commit — so this
+// measures raw statement throughput, not transactional/atomicity cost.
 void RunNewOrderTransaction(Database& db, std::mt19937& rng, int64_t order_id) {
   std::uniform_int_distribution<int64_t> w_dist(0, kNumWarehouses - 1);
   std::uniform_int_distribution<int64_t> c_dist(0, kCustomersPerWarehouse - 1);

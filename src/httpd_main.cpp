@@ -14,16 +14,12 @@ void HandleSignal(int) {
   if (g_server != nullptr) g_server->Stop();
 }
 
-// Runs each non-empty, non-comment ("--" prefix) line of `path` as its own
-// statement against `db` before the server starts serving. This exists
-// because the SQL layer's catalog is in-memory only and doesn't persist
-// across a Database being reconstructed (see DESIGN.md's Phase 6 section)
-// — a fresh dbengine_httpd process otherwise has no way to know a table
-// exists, even though the row bytes a separate CLI session wrote are
-// still sitting on disk. Loading schema/seed data this way keeps the
-// server's actual network-facing API strictly read-only: nothing here
-// runs in response to an HTTP request, only at local startup, driven by a
-// file the operator controls.
+// Replays each non-empty, non-comment ("--" prefix) line of `path` as a
+// statement against `db` before the server starts serving. The SQL catalog
+// is in-memory only and doesn't persist across process restarts, so this is
+// how a fresh process learns about tables a separate CLI session already
+// created on disk. Runs only at startup, never in response to a request,
+// keeping the network-facing API read-only.
 void RunSchemaFile(dbengine::Database* db, const std::string& path) {
   std::ifstream in(path);
   if (!in) throw std::runtime_error("failed to open schema file: " + path);

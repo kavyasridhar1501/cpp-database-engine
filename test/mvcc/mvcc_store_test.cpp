@@ -122,9 +122,8 @@ TEST(MVCCStoreTest, WriteWriteConflictAbortsSecondCommitter) {
 }
 
 // ---------------------------------------------------------------------
-// Anomaly demonstrations. Interleavings are forced explicitly by issuing
-// calls from a single thread in a chosen order (not by racing timers), so
-// these are deterministic every run.
+// Anomaly demonstrations. Interleavings are forced by call order on a
+// single thread (not racing timers), so these are deterministic.
 // ---------------------------------------------------------------------
 
 TEST(MVCCStoreTest, DirtyReadUnderReadUncommitted) {
