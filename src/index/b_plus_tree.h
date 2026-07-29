@@ -14,12 +14,10 @@ namespace dbengine {
 // values (capped at MAX_VALUE_SIZE) via a BufferPoolManager. Every node is
 // exactly one page; leaves are linked left-to-right for range scans.
 //
-// Concurrency: a single mutex serializes all mutation and lookup. This is a
-// deliberate Phase 2 simplification (correctness and a working head-to-head
-// comparison first) — see DESIGN.md. In particular, an Iterator returned by
-// Begin() holds a pin on its current leaf but does *not* hold the tree
-// mutex between calls, so concurrent mutation during a scan is out of scope
-// until concurrency control is revisited (Phase 5).
+// Concurrency: a single mutex serializes all mutation and lookup. An
+// Iterator returned by Begin() holds a pin on its current leaf but does
+// *not* hold the tree mutex between calls, so concurrent mutation during a
+// scan is unsupported.
 class BPlusTree {
  public:
   // `root_page_id` is INVALID_PAGE_ID for a brand-new tree, or a
