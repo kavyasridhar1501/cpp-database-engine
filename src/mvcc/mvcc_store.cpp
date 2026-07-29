@@ -258,11 +258,10 @@ size_t MVCCStore::RunGarbageCollection() {
                 return a->commit_ts < b->commit_ts;
               });
 
-    // The newest committed version is always kept (nothing to supersede
-    // it). Every other committed version committed[i] is the visible
-    // version for a snapshot with start_ts s exactly when
-    // committed[i].commit_ts <= s < committed[i+1].commit_ts; it's safe to
-    // reclaim iff no active transaction's start_ts falls in that range.
+    // The newest committed version is always kept. Version committed[i] is
+    // the visible one for a snapshot with start_ts s exactly when
+    // committed[i].commit_ts <= s < committed[i+1].commit_ts, so it's safe
+    // to reclaim iff no active start_ts falls in that range.
     for (size_t i = 0; i + 1 < committed.size(); ++i) {
       int64_t lo = committed[i]->commit_ts;
       int64_t hi = committed[i + 1]->commit_ts;

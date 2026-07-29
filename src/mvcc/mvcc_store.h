@@ -17,18 +17,14 @@
 namespace dbengine {
 
 // Snapshot-isolation-style multi-version concurrency control over an
-// in-memory key/value table. This is deliberately NOT a StorageEngine: the
-// StorageEngine interface (Get/Put/Delete/Scan) has no room for transaction
-// boundaries or isolation levels, and MVCC's whole point is to demonstrate
-// those. See DESIGN.md's Phase 5 section for why this sits beside the disk
-// engines rather than trying to retrofit into their interface, and for why
-// plain SNAPSHOT isolation is expected to still allow write skew (only
-// SERIALIZABLE_SNAPSHOT below closes that hole).
+// in-memory key/value table. Deliberately not a StorageEngine, since that
+// interface has no room for transaction boundaries or isolation levels.
+// Plain SNAPSHOT isolation still allows write skew; only
+// SERIALIZABLE_SNAPSHOT closes that hole.
 //
 // Concurrency-safety contract: exactly one thread drives a given txn_id at a
-// time (Begin/Read/Write/Delete/Commit/Abort are never called concurrently
-// for the same txn_id from two threads) — a standard one-thread-per-session
-// model. Different txn_ids may run fully concurrently on different threads.
+// time (one-thread-per-session). Different txn_ids may run fully
+// concurrently on different threads.
 enum class IsolationLevel {
   READ_UNCOMMITTED,
   READ_COMMITTED,
@@ -101,15 +97,11 @@ class MVCCStore {
     std::unordered_set<KeyType> read_set;
   };
 
-  // The active-transaction table is sharded by txn_id so that concurrent
-  // transactions on different threads mostly avoid contending on the same
-  // mutex — a single global mutex here would otherwise become the
-  // bottleneck that dominates multi-threaded throughput regardless of how
-  // fine-grained the per-key VersionChain locking is (every Begin/Commit
-  // touches the transaction table; only Read/Write of the *same* key
-  // touches the same VersionChain). See DESIGN.md's Phase 5 section — this
-  // sharding was added after the throughput-scaling benchmark showed
-  // exactly that bottleneck with a single mutex.
+  // Sharded by txn_id so concurrent transactions on different threads
+  // mostly avoid contending on the same mutex: every Begin/Commit touches
+  // the transaction table, so a single global mutex here would bottleneck
+  // multi-threaded throughput regardless of the per-key VersionChain
+  // locking's granularity.
   struct TxnShard {
     std::mutex mutex;
     std::unordered_map<int64_t, std::unique_ptr<Transaction>> txns;

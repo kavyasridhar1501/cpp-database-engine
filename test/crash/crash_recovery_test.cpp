@@ -1,11 +1,8 @@
-// The Phase 4 deliverable: fork the standalone crash_worker (see
-// crash_worker.cpp), let it run for a random short duration with no
-// artificial pacing, SIGKILL it, then reopen the same database (triggering
-// recovery) and verify every key matches what the side-effect log proves
-// was durable — no more, no less. Run hundreds of times so the random
-// kill points sweep a wide range of positions in the operation sequence:
-// mid-BEGIN, mid-UPDATE, mid-COMMIT-before-fsync-returns,
-// mid-ABORT-before-undo-completes, mid-checkpoint, and everything between.
+// Forks the standalone crash_worker (see crash_worker.cpp), lets it run
+// unpaced for a random short duration, SIGKILLs it, reopens the database to
+// trigger recovery, and verifies every key matches what the side-effect log
+// proves was durable. Run hundreds of times to sweep random kill points
+// across the operation sequence.
 
 #include <fcntl.h>
 #include <signal.h>
@@ -47,14 +44,9 @@ void CleanupEngineFiles(const std::string& db_path) {
   }
 }
 
-// The worker brackets every attempted write with an 'A' line (just before
-// the engine call) and a 'C' line (just after it returns), both
-// individually fsynced. A kill can land between the engine call actually
-// completing and either of those lines reaching disk, so at most the very
-// last bracket in the file can be left "dangling" (an 'A' with no matching
-// 'C') — that one key's outcome is genuinely ambiguous (the DB may or may
-// not reflect it); every other key's last 'C' value is unambiguous and
-// must match the DB exactly.
+// At most the last A/C bracket in the side log can be left dangling (an 'A'
+// with no matching 'C'); that one key's outcome is genuinely ambiguous, but
+// every other key's last 'C' value must match the DB exactly.
 struct CrashOracle {
   std::map<int64_t, std::string> last_confirmed;
   bool has_ambiguous = false;
@@ -90,8 +82,6 @@ CrashOracle ParseSideLog(const std::string& side_log_path) {
   return oracle;
 }
 
-// Forks and execs the worker, lets it run unpaced for a random short delay,
-// SIGKILLs it, reaps it, and returns the parsed crash oracle.
 CrashOracle RunOneCrashCycle(const std::string& worker_path, const std::string& engine_type,
                              const std::string& db_path, const std::string& side_log_path,
                              std::mt19937& rng) {
@@ -124,9 +114,8 @@ CrashOracle RunOneCrashCycle(const std::string& worker_path, const std::string& 
   return ParseSideLog(side_log_path);
 }
 
-// Asserts the engine's state for every key in [0, kKeyRange) is consistent
-// with the oracle: an exact match for every unambiguous key, and one of
-// the two legitimate outcomes for the (at most one) ambiguous key.
+// Exact match for every unambiguous key; one of two legitimate outcomes for
+// the at-most-one ambiguous key.
 template <typename Engine>
 void VerifyAgainstOracle(Engine& engine, const CrashOracle& oracle, int cycle) {
   for (int64_t k = 0; k < kKeyRange; ++k) {
@@ -184,10 +173,8 @@ TEST(CrashRecoveryTest, BPlusTreeSurvivesRepeatedRandomKills) {
     WALBPlusTreeEngine engine(db_path, 16, /*enable_wal=*/true);
     VerifyAgainstOracle(engine, oracle, cycle);
 
-    // Every transaction that wrote this sentinel key was aborted; it must
-    // never be visible, whether the abort itself completed before the kill
-    // or not (that's what CLR resumability is for) — this key never
-    // appears in the side log at all, so it's never "ambiguous".
+    // Sentinel key: only written by aborted txns, so it must never be
+    // visible regardless of when the kill landed relative to the abort.
     std::string poison_value;
     ASSERT_FALSE(engine.Get(kKeyRange, &poison_value))
         << "cycle " << cycle << ": an aborted transaction's write survived recovery";

@@ -173,11 +173,6 @@ TEST_F(BPlusTreeTest, ScanFromKeyBeyondAllEntriesIsEmpty) {
   EXPECT_TRUE(tree->Begin(1000).IsEnd());
 }
 
-// The core correctness deliverable: a randomized sequence of insert/delete/
-// lookup operations, validated at every step against an in-memory
-// std::map oracle, with a buffer pool small enough (relative to the tree's
-// page count) to force real eviction and reload from disk, and node sizes
-// small enough to force frequent splits, merges, and redistributes.
 TEST_F(BPlusTreeTest, RandomizedOperationsMatchStdMapOracle) {
   constexpr int kNumOps = 20000;
   constexpr int kKeyRange = 3000;

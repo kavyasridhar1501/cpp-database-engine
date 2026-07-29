@@ -13,10 +13,8 @@ struct ColumnDefAst {
   ColumnType type;
 };
 
-// column[0] must be INTEGER — it's the table's primary key, and the only
-// column the underlying StorageEngine can index (KeyType is a fixed
-// int64_t across this whole project). See DESIGN.md for why the SQL layer
-// inherits that constraint rather than working around it.
+// column[0] must be INTEGER: it's the primary key, and the only column the
+// underlying StorageEngine can index (KeyType is a fixed int64_t).
 struct CreateTableStmt {
   std::string table_name;
   std::vector<ColumnDefAst> columns;
@@ -35,8 +33,7 @@ struct Comparison {
   Value literal;
 };
 
-// AND-conjunction of comparisons; no OR, no parenthesized sub-expressions —
-// deliberately tiny (see DESIGN.md). Empty means no WHERE clause.
+// AND-conjunction of comparisons; no OR or sub-expressions. Empty means no WHERE clause.
 using Predicate = std::vector<Comparison>;
 
 struct SelectStmt {

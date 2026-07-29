@@ -120,9 +120,6 @@ TEST_F(LSMTreeEngineTest, PutValueExceedingMaxSizeThrows) {
   EXPECT_THROW(engine.Put(1, too_big), std::invalid_argument);
 }
 
-// The Phase 3 deliverable: demonstrate SSTables actually get created (via
-// memtable flush) and compacted (merged into a higher tier) under normal
-// write load, not just as an isolated unit test of the builder.
 TEST_F(LSMTreeEngineTest, FlushAndCompactionDemo) {
   // A tiny flush threshold and tier threshold so a modest key count forces
   // several flushes and at least one compaction.
@@ -153,10 +150,7 @@ TEST_F(LSMTreeEngineTest, FlushAndCompactionDemo) {
   }
   EXPECT_EQ(count, kNumKeys);
 
-  // Space amplification sanity: on-disk bytes shouldn't have ballooned to
-  // some huge multiple of the raw data (loose bound; the point is proving
-  // compaction reclaimed the pre-compaction SSTables' space, not obtaining
-  // a tight ratio).
+  // Loose bound: just proving compaction reclaimed pre-compaction space.
   size_t raw_bytes = static_cast<size_t>(kNumKeys) * (sizeof(KeyType) + 10);
   EXPECT_LT(engine.TotalSSTableBytesOnDisk(), raw_bytes * 20);
 }
@@ -199,12 +193,6 @@ TEST_F(LSMTreeEngineTest, DeleteSurvivesFlushAndReopen) {
   }
 }
 
-// The core correctness deliverable for this engine: randomized insert/
-// delete/lookup validated against a std::map oracle, with a small flush
-// threshold and tier threshold so the run genuinely exercises flush,
-// compaction (including background compaction racing with foreground
-// operations), and tombstone handling — not just the in-memory memtable
-// path.
 TEST_F(LSMTreeEngineTest, RandomizedOperationsMatchStdMapOracle) {
   constexpr int kNumOps = 20000;
   constexpr int kKeyRange = 3000;
@@ -258,16 +246,11 @@ TEST_F(LSMTreeEngineTest, RandomizedOperationsMatchStdMapOracle) {
 
 // --- Memtable WAL (durability for the active memtable) ---
 //
-// The engine's destructor always does a graceful final flush of a
-// non-empty memtable (established Phase 3 behavior, kept for parity with
-// BPlusTreeEngine's "close it, reopen it, data's there" experience), which
-// means an in-process test can't simulate "crashed before flush" by simply
-// letting an engine go out of scope — that always takes the graceful path
-// regardless of whether WAL is enabled. Real crash durability for this
-// engine is validated by the crash-injection harness (kill -9, hundreds of
-// runs); these tests instead check the replay mechanism directly and
-// deterministically, by hand-crafting exactly what a crash would leave
-// behind.
+// The destructor always does a graceful final flush of a non-empty
+// memtable, so an in-process test can't simulate "crashed before flush" by
+// just letting an engine go out of scope. These tests hand-craft what a
+// crash would leave behind and check replay directly instead; real kill -9
+// durability is covered by the crash-injection harness.
 
 TEST_F(LSMTreeEngineTest, WalDisabledByDefaultPreservesPhase3Behavior) {
   LSMTreeEngine engine(file_path_, 1024, 3);
@@ -301,9 +284,8 @@ TEST_F(LSMTreeEngineTest, WalEnabledLogsWritesAndRotatesGenerationOnFlush) {
 }
 
 TEST_F(LSMTreeEngineTest, ReplaysLeftoverMemWALGenerationOnStartup) {
-  // Hand-craft a leftover WAL generation file, exactly as if a crash had
-  // happened right after these writes were logged but before the next
-  // flush.
+  // Hand-craft a leftover WAL generation file, as if a crash happened right
+  // after these writes were logged but before the next flush.
   std::string wal_path = file_path_ + ".memwal0";
   {
     LogManager wal(wal_path);

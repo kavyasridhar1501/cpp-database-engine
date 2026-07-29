@@ -7,13 +7,9 @@
 
 namespace dbengine {
 
-// A standard bit-array Bloom filter over KeyType keys, using double hashing
-// (Kirsch & Mitzenmacher, "Less Hashing, Same Performance", 2006) to derive
-// k hash functions from two independent 64-bit mixes instead of k separate
-// hash functions. One of these sits in front of every SSTable so a point
-// lookup that would otherwise need a disk read to learn "not present" can
-// usually be answered from an in-memory bit test instead. Original
-// implementation, not vendored.
+// Bit-array Bloom filter over KeyType keys, using double hashing (Kirsch &
+// Mitzenmacher) to derive k hash functions from two 64-bit mixes. Fronts
+// each SSTable so a "definitely absent" lookup can skip a disk read.
 class BloomFilter {
  public:
   // Sizes the filter for `expected_keys` entries at `false_positive_rate`

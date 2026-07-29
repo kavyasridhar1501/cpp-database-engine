@@ -20,14 +20,10 @@ struct QueryResult {
   std::string message;                      // human-readable summary, e.g. "SELECT 3", "INSERT 1"
 };
 
-// The SQL front-end's entry point: parses a statement, plans it, executes
-// it against a single StorageEngine shared by every table in this
-// database (see catalog.h for the table-id key-prefixing scheme that makes
-// that possible), and returns a QueryResult. One statement per call —
-// there is no multi-statement batching.
-//
-// The catalog is in-memory only and does not persist across a Database
-// being destroyed and reconstructed on the same file — see DESIGN.md.
+// SQL front-end entry point: parses, plans, and executes one statement per
+// call against a single shared StorageEngine (see catalog.h for the
+// table-id key-prefixing scheme). The catalog is in-memory only, so it does
+// not persist across a Database being destroyed and reopened on the same file.
 class Database {
  public:
   explicit Database(const std::string& db_path, EngineType engine_type = EngineType::BTREE);

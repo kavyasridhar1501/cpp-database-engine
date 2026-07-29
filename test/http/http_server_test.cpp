@@ -18,10 +18,8 @@ struct HttpResponse {
   std::string body;
 };
 
-// A tiny raw-socket HTTP client, just enough to exercise HttpServer: sends
-// a request line + Connection: close, reads until the server closes the
-// socket, splits status line from body. No keep-alive, no chunked
-// encoding — HttpServer never produces either.
+// Minimal raw-socket HTTP client; no keep-alive or chunked encoding since
+// HttpServer never produces either.
 HttpResponse SendRequest(int port, const std::string& method, const std::string& target) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   EXPECT_GE(fd, 0);
@@ -31,11 +29,9 @@ HttpResponse SendRequest(int port, const std::string& method, const std::string&
   addr.sin_port = htons(static_cast<uint16_t>(port));
   inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
 
-  // The listening socket exists (and is already listen()-ing) by the time
-  // HttpServer's constructor returns, so connect() succeeding doesn't
-  // depend on Run()'s accept loop having started yet — the kernel queues
-  // it. A short retry loop here is just extra insurance for a loaded CI
-  // box, not covering a real race.
+  // Kernel queues the connection once HttpServer's constructor returns
+  // (listen() already called), so this doesn't race Run()'s accept loop;
+  // retry is just insurance for a loaded CI box.
   int rc = -1;
   for (int attempt = 0; attempt < 50 && rc != 0; ++attempt) {
     rc = connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));

@@ -10,11 +10,8 @@ namespace dbengine {
 
 enum class AccessPathType { POINT_LOOKUP, RANGE_SCAN, FULL_SCAN };
 
-// What the executor should do to satisfy a WHERE clause: this project's
-// "tiny optimizer" is entirely about picking one of these three, since the
-// primary key is the only indexed column (see catalog.h — KeyType is a
-// single int64_t across every storage engine, so there's no secondary
-// index to consider). See DESIGN.md for the selection rules.
+// What the executor should do to satisfy a WHERE clause. The primary key is
+// the only indexed column, so there's no secondary index to consider.
 struct Plan {
   AccessPathType access_path = AccessPathType::FULL_SCAN;
 

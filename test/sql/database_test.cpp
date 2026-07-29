@@ -75,9 +75,7 @@ TEST_P(DatabaseTest, SelectProjectsRequestedColumnsOnly) {
 }
 
 TEST_P(DatabaseTest, UpdateSemanticsViaReinsert) {
-  // No UPDATE statement in this tiny grammar (see DESIGN.md); Put()
-  // semantics are upsert, so re-INSERTing an existing primary key
-  // overwrites the row — this test documents and locks in that behavior.
+  // No UPDATE statement; re-INSERTing an existing primary key upserts.
   Database db = MakeDatabase();
   db.Execute("CREATE TABLE t (id INTEGER, name TEXT)");
   db.Execute("INSERT INTO t VALUES (1, 'first')");
@@ -151,11 +149,6 @@ TEST_P(DatabaseTest, ThrowsOnNegativePrimaryKey) {
   EXPECT_THROW(db.Execute("INSERT INTO t VALUES (-1)"), SqlException);
 }
 
-// Randomized oracle test: sequential INSERT/DELETE/SELECT-by-id operations
-// against the SQL layer, checked against a std::map<int64_t, std::string>
-// mirroring what the single TEXT column should hold for each primary key —
-// same testing philosophy as every other storage-engine phase in this
-// project (see DESIGN.md).
 TEST_P(DatabaseTest, RandomizedOracleAgainstStdMap) {
   Database db = MakeDatabase();
   db.Execute("CREATE TABLE t (id INTEGER, v TEXT)");

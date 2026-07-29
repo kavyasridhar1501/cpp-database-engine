@@ -18,12 +18,9 @@ namespace dbengine {
 
 // StorageEngine backed by an LSM-tree: an in-memory skip-list memtable
 // flushed to immutable, page-based, Bloom-filtered SSTables once it crosses
-// a size threshold, with a background thread that merges a "tier" of
-// SSTables into one larger SSTable (promoted to the next tier) once that
-// tier accumulates `tier_compaction_threshold` tables — classic size-tiered
-// compaction. See DESIGN.md for the concurrency model (snapshot reads via
-// shared_ptr, synchronous flush, asynchronous compaction) and the
-// simplifications made relative to a production LSM engine.
+// a size threshold, with a background thread doing size-tiered compaction —
+// merging a tier's SSTables into one larger table promoted to the next tier
+// once the tier hits `tier_compaction_threshold` tables.
 //
 // Each SSTable is its own file (db_path + ".sst" + id); a small manifest
 // page (page 0 of `db_path` itself) tracks which SSTable ids belong to
@@ -32,9 +29,7 @@ class LSMTreeEngine : public StorageEngine {
  public:
   // `enable_wal` adds durability for the active memtable: every Put/Delete
   // is logged (and fsynced) before being applied, so a crash before the
-  // next flush doesn't lose recent writes — the gap Phase 3 documented as
-  // a known limitation. Default off, preserving Phase 3's behavior for
-  // existing callers/tests/benchmarks that don't ask for it.
+  // next flush doesn't lose recent writes. Off by default.
   explicit LSMTreeEngine(const std::string& db_path, size_t memtable_flush_threshold_bytes = 1 << 20,
                          int tier_compaction_threshold = 4, bool enable_wal = false);
   ~LSMTreeEngine() override;
@@ -62,13 +57,11 @@ class LSMTreeEngine : public StorageEngine {
   static constexpr int kMaxManifestTiers = 8;
   static constexpr int kMaxSSTablesPerManifestTier = 16;
 
-  // Backpressure threshold, comfortably below kMaxSSTablesPerManifestTier:
-  // if a tier reaches this size, a writer whose flush just landed there
-  // helps compact it inline (see FlushActiveMemtable) instead of trusting
-  // the background thread's scheduling alone. Without this, a foreground
-  // loop issuing writes fast enough can starve the background compaction
-  // thread of lock time and grow a tier past its hard manifest capacity —
-  // observed in practice under CI-style stress (see DESIGN.md).
+  // Backpressure threshold below kMaxSSTablesPerManifestTier: a writer whose
+  // flush lands in a tier this large helps compact it inline (see
+  // FlushActiveMemtable) rather than trusting the background thread alone,
+  // which a fast foreground write loop can starve of lock time, growing a
+  // tier past its hard manifest capacity.
   static constexpr int kWriteStallTierSize = 8;
 
  private:
@@ -76,10 +69,9 @@ class LSMTreeEngine : public StorageEngine {
   std::string MemWALPath(int64_t generation) const;
   void LoadManifestOrInitialize();
   void PersistManifestLocked();
-  // Finds any memtable-WAL generation files left over from a crash (there
-  // should be at most a couple — see DESIGN.md), replays them into
-  // active_memtable_ in order, re-logs that replayed data into a fresh
-  // generation, and removes the old files. No-op if !wal_enabled_.
+  // Replays any memtable-WAL generation files left over from a crash into
+  // active_memtable_ in order, re-logs them into a fresh generation, and
+  // removes the old files. No-op if !wal_enabled_.
   void RecoverMemWALOnStartup();
   void FlushActiveMemtable();
   void CompactionLoop();

@@ -24,13 +24,8 @@ void RemoveEngineFiles(const std::string& path) {
 }
 
 // Builds (once, untimed) a WAL-enabled engine whose log holds `num_ops`
-// UPDATE records under a *single* transaction (one Begin/Commit, one
-// fsync total) — since this variant never checkpoints, what happens
-// inside a transaction doesn't matter to what we're measuring (Redo
-// replays every UPDATE record regardless of committed/loser status), and
-// batching into one commit keeps setup fast enough to sweep large log
-// sizes (fsync, not the operation itself, dominates commit cost — see the
-// WAL on/off benchmark below).
+// UPDATE records under a single transaction (one fsync total), keeping
+// setup fast enough to sweep large log sizes.
 void BuildLoggedEngineNoCheckpoint(const std::string& path, int64_t num_ops) {
   RemoveEngineFiles(path);
   WALBPlusTreeEngine engine(path, kBufferPoolFrames, /*enable_wal=*/true,
@@ -43,10 +38,9 @@ void BuildLoggedEngineNoCheckpoint(const std::string& path, int64_t num_ops) {
 }
 
 // Builds (once, untimed) a WAL-enabled engine with `num_ops` committed
-// single-key Puts (each its own transaction), checkpointing every 100
-// commits — needed so periodic checkpoints actually happen, at the cost of
-// num_ops individual fsyncs during setup, which bounds how far this
-// variant can be swept versus the single-transaction version above.
+// single-key Puts, checkpointing every 100 commits — costs num_ops
+// individual fsyncs during setup, so this sweeps a smaller range than the
+// single-transaction version above.
 void BuildLoggedEngineWithCheckpoints(const std::string& path, int64_t num_ops) {
   RemoveEngineFiles(path);
   WALBPlusTreeEngine engine(path, kBufferPoolFrames, /*enable_wal=*/true,
@@ -82,11 +76,8 @@ BENCHMARK(BM_RecoveryTime_NoCheckpoint)
     ->UseManualTime()
     ->Unit(benchmark::kMillisecond);
 
-// Same idea, but checkpointing every 100 committed transactions — Redo
-// only needs to replay what's happened since the most recent checkpoint,
-// so recovery time should stay roughly flat as num_ops grows, in contrast
-// to the unbounded-log version above. Capped lower than the no-checkpoint
-// sweep because setup here costs one fsync per commit.
+// Same idea, but checkpointing every 100 committed transactions: recovery
+// time should stay roughly flat as num_ops grows, unlike the version above.
 void BM_RecoveryTime_PeriodicCheckpoints(benchmark::State& state) {
   int64_t num_ops = state.range(0);
   std::string path = TempPath("recovery_ckpt_" + std::to_string(num_ops));

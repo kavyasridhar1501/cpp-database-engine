@@ -33,12 +33,10 @@ class MemTableCursor : public LSMCursor {
   MemTable::Iterator it_;
 };
 
-// Holds a shared_ptr to the SSTable alongside its iterator so the table
-// (and the pin its iterator holds) stays valid for the cursor's lifetime,
-// even if the engine's compaction thread concurrently retires the table
-// from its tier list. Declaration order matters here: `sst_` must outlive
-// `it_`, and C++ destroys members in reverse declaration order, so `sst_`
-// is declared first (destroyed last).
+// Holds a shared_ptr to the SSTable so it (and the pin its iterator holds)
+// stays valid even if compaction concurrently retires it. `sst_` must be
+// declared before `it_` so it outlives it (members destroy in reverse
+// declaration order).
 class SSTableCursor : public LSMCursor {
  public:
   SSTableCursor(std::shared_ptr<SSTable> sst, SSTable::Iterator it)

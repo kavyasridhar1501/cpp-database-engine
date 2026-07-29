@@ -8,23 +8,17 @@
 
 namespace dbengine {
 
-// A minimal, read-only HTTP/1.1 server over raw POSIX sockets — no
-// external web framework, consistent with this project's "no external
-// libraries" rule (see DESIGN.md's Phase 8 section for the full
-// rationale). Two routes:
+// A minimal, read-only HTTP/1.1 server over raw POSIX sockets. Two routes:
 //
-//   GET /health        -> 200, body "ok"
+//   GET /health         -> 200, body "ok"
 //   GET /query?sql=...  -> runs a SELECT (only) and returns its rows as
 //                          JSON; any other statement type, or a statement
 //                          that fails to parse/plan/execute, gets a 400
 //                          with a JSON {"error": "..."} body.
 //
-// Single-threaded, one connection handled at a time (Run()'s accept loop
-// blocks on the next connection until the current one's response is
-// written and its socket closed) — deliberately, since Database isn't
-// designed for concurrent StorageEngine access from multiple threads (see
-// DESIGN.md); this keeps every request trivially safe without needing to
-// reason about that.
+// Single-threaded, one connection at a time: Database isn't designed for
+// concurrent StorageEngine access from multiple threads, so this keeps
+// every request trivially safe without needing to reason about that.
 class HttpServer {
  public:
   // `port` == 0 asks the OS to pick a free port; call GetBoundPort() after
@@ -50,13 +44,8 @@ class HttpServer {
   Database* db_;
   int listen_fd_ = -1;
   int bound_port_ = -1;
-  // Starts true (not false) specifically so Stop() can never race Run():
-  // if Stop() were called before the thread running Run() actually got
-  // scheduled, Run()'s old behavior of unconditionally setting this to
-  // true as its first statement would silently undo the stop signal and
-  // loop forever. Initializing true here and never writing true again
-  // anywhere makes Stop() a one-way, race-free transition to false
-  // regardless of the relative timing between Stop() and Run() starting.
+  // Starts true (never set true again) so a Stop() called before Run()'s
+  // thread is even scheduled can't be clobbered by Run() resetting it.
   std::atomic<bool> running_{true};
 };
 

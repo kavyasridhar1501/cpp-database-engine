@@ -22,10 +22,8 @@ using dbengine::KeyType;
 using dbengine::LSMTreeEngine;
 using dbengine::StorageEngine;
 
-// Same buffer pool size used for both engines' comparisons in Phase 2 —
-// deliberately small relative to the dataset (see DESIGN.md), so both
-// engines are compared under the same "index doesn't fully fit in RAM"
-// condition rather than one benefiting from a bigger effective cache.
+// Deliberately small relative to the dataset, so both engines are compared
+// under the same "index doesn't fully fit in RAM" condition.
 constexpr size_t kBufferPoolFrames = 2000;
 constexpr size_t kLSMFlushThresholdBytes = 256 * 1024;
 constexpr int kLSMTierThreshold = 4;
@@ -68,8 +66,7 @@ struct Op {
   KeyType key;
 };
 
-// Zipfian-distributed keys (skewed popularity, matching the Phase 1
-// benchmark's methodology), mixed read/write per `write_fraction`.
+// Zipfian-distributed keys, mixed read/write per `write_fraction`.
 std::vector<Op> GenerateWorkload(int num_ops, int64_t key_range, double write_fraction, unsigned seed) {
   std::vector<double> weights(static_cast<size_t>(key_range));
   for (int64_t i = 0; i < key_range; ++i) {
@@ -120,9 +117,7 @@ EngineStats GetStats<LSMTreeEngine>(LSMTreeEngine& engine) {
 }
 
 // LSM-tree compaction runs on a background thread; give it a moment to
-// settle so amplification numbers reflect a steady state rather than a
-// snapshot mid-compaction. No-op (just a wasted, harmless sleep) for the
-// B+-tree, which has no background work.
+// settle so amplification numbers reflect steady state, not mid-compaction. No-op for B+-tree.
 template <typename EngineT>
 void SettleBackgroundWork() {
   if constexpr (std::is_same_v<EngineT, LSMTreeEngine>) {
@@ -141,10 +136,8 @@ std::unique_ptr<EngineT> BuildPopulatedEngine(const std::string& path) {
   return engine;
 }
 
-// Runs `ops` once (registered with ->Iterations(1)) against a freshly
-// populated engine and reports throughput, average latency, and read/write
-// amplification (disk reads/writes per op, and total on-disk bytes versus
-// the logical dataset size) as Google Benchmark counters.
+// Runs `ops` against a freshly populated engine and reports throughput,
+// latency, and read/write amplification as counters.
 template <typename EngineT>
 void RunPointWorkload(benchmark::State& state, const std::string& label, double write_fraction) {
   std::string path = TempPath(label);
@@ -183,9 +176,7 @@ void RunPointWorkload(benchmark::State& state, const std::string& label, double 
   double logical_bytes = static_cast<double>(kNumKeys) * (sizeof(KeyType) + 8);
   state.counters["SpaceAmp"] = static_cast<double>(after.on_disk_bytes) / logical_bytes;
 
-  // Destroy the engine (an LSM engine's destructor does one final flush,
-  // which creates one more file) before removing files, or that last file
-  // would be orphaned.
+  // LSM engine's destructor does one final flush; destroy before removing files or it's orphaned.
   engine.reset();
   RemoveEngineFiles(path);
 }
@@ -235,11 +226,8 @@ void RunRangeScanWorkload(benchmark::State& state, const std::string& label) {
   RemoveEngineFiles(path);
 }
 
-// Sweeps write fraction across the write-heavy (90%) / read-heavy (95%
-// reads, i.e. 5% writes) range the Phase 3 brief asks for, plus enough
-// intermediate points (10/30/50/70%) to actually locate where the two
-// engines' throughput curves cross, rather than only reporting the two
-// endpoints. state.range(0) is the write percentage.
+// Sweeps write fraction to locate where the two engines' throughput curves
+// cross. state.range(0) is the write percentage.
 void BM_MixedWorkload_BPlusTree(benchmark::State& state) {
   int write_pct = static_cast<int>(state.range(0));
   RunPointWorkload<BPlusTreeEngine>(state, "mixed_bptree_" + std::to_string(write_pct),

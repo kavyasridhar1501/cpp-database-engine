@@ -24,9 +24,7 @@ using dbengine::page_id_t;
 using dbengine::Replacer;
 
 // Generates `length` page accesses over [0, num_pages) following a Zipfian
-// distribution (skew 0.99, the standard YCSB default) — a small number of
-// "hot" low-numbered pages absorb most of the traffic, matching the skewed
-// key-popularity seen in real OLTP workloads.
+// distribution: a small number of "hot" low-numbered pages absorb most of the traffic.
 std::vector<page_id_t> BuildZipfianTrace(int num_pages, int length, double skew, unsigned seed) {
   std::vector<double> weights(static_cast<size_t>(num_pages));
   for (int i = 0; i < num_pages; ++i) {
@@ -42,13 +40,10 @@ std::vector<page_id_t> BuildZipfianTrace(int num_pages, int length, double skew,
   return trace;
 }
 
-// Same Zipfian hot-page traffic, but with a cold sequential scan of a
-// disjoint page range injected every `scan_interval` accesses. This is the
-// textbook workload for demonstrating LRU-K/CLOCK's resistance to
-// "sequential flooding": under plain LRU, a big one-time scan pushes every
-// hot page out of the cache because recency alone can't distinguish a page
-// that will be touched once from one that's touched constantly. See O'Neil,
-// O'Neil & Weikum, SIGMOD 1993, and the 15-445 buffer-replacement lecture.
+// Same Zipfian hot-page traffic, with a cold sequential scan injected every
+// `scan_interval` accesses — tests resistance to "sequential flooding",
+// where plain LRU evicts hot pages because recency can't tell a page
+// touched once from one touched constantly.
 std::vector<page_id_t> BuildZipfianWithScanTrace(int hot_pages, int cold_pages, int length,
                                                   double skew, int scan_interval, int scan_length,
                                                   unsigned seed) {
@@ -98,13 +93,9 @@ std::string TempDbPath(const std::string& label) {
   return (std::filesystem::temp_directory_path() / ("dbengine_bpm_bench_" + label + ".db")).string();
 }
 
-// Replays `trace` through a fresh BufferPoolManager (fresh DiskManager file,
-// `num_pages` pre-allocated) sized to state.range(0) frames, using the
-// replacer `make_replacer` produces. Reports the resulting hit rate as a
-// custom counter alongside standard Google Benchmark timing. Registered
-// with ->Iterations(1) so each run is a single deterministic replay instead
-// of an averaged-over-N-warm-reps loop, which would conflate "first replay
-// cold-starts the cache" with "later replays are mostly hits".
+// Replays `trace` through a fresh BufferPoolManager and reports hit rate as
+// a custom counter. Uses ->Iterations(1): averaging over multiple replays
+// would conflate a cold-start first pass with mostly-hit later ones.
 void RunTrace(benchmark::State& state, const std::string& label, const std::vector<page_id_t>& trace,
               int num_pages, const std::function<std::unique_ptr<Replacer>(size_t)>& make_replacer) {
   const auto pool_size = static_cast<size_t>(state.range(0));

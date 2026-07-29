@@ -10,8 +10,7 @@ enum class TokenType {
                       // parser matches keyword text case-insensitively
                       // rather than the lexer special-casing each one.
   INTEGER_LITERAL,
-  STRING_LITERAL,     // single-quoted; '' inside is not supported (tiny
-                      // scope — see DESIGN.md)
+  STRING_LITERAL,     // single-quoted; '' inside is not supported
   LPAREN,
   RPAREN,
   COMMA,
